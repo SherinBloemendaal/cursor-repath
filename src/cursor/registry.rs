@@ -6,7 +6,9 @@ use serde_json::Value;
 
 pub const LEGACY_HEADERS_KEY: &str = "composer.composerHeaders";
 pub const LOCAL_COMPOSER_DATA_KEY: &str = "composer.composerData";
+pub const LOCAL_PINNED_KEY: &str = "cursor/pinnedComposers";
 
+/// Families keyed `<prefix><chatId>:<rest>`.
 pub const COMPOSER_PREFIXES: &[&str] = &[
     "bubbleId:",
     "checkpointId:",
@@ -14,9 +16,37 @@ pub const COMPOSER_PREFIXES: &[&str] = &[
     "codeBlockPartialInlineDiffFates:",
     "messageRequestContext:",
     "ofsContent:",
+    "agentKv:bubbleCheckpoint:",
 ];
 
-pub const COMPOSER_EXACT_PREFIXES: &[&str] = &["composerData:", "composerVirtualRowHeights:"];
+/// Families keyed exactly `<prefix><chatId>`.
+pub const COMPOSER_EXACT_PREFIXES: &[&str] = &[
+    "composerData:",
+    "composerVirtualRowHeights:",
+    "agentKv:checkpoint:",
+];
+
+/// Content-addressed blobs shared between chats.
+pub const BLOB_PREFIX: &str = "agentKv:blob:";
+
+/// Families keyed `<prefix><workspaceId>:<rest>`.
+pub const WORKSPACE_PREFIXES: &[&str] = &["inlineDiff:", "patch-graph:"];
+
+/// ItemTable keys in the global database that carry workspace paths.
+pub const PLAN_KEYS: &[&str] = &["composer.planRegistry", "composer.planRedirects"];
+
+/// Global `state.vscdb` schema as Cursor creates it.
+pub const GLOBAL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+CREATE TABLE IF NOT EXISTS composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT);
+CREATE INDEX IF NOT EXISTS idx_composerHeaders_0 ON composerHeaders (workspaceId, isSubagent, isArchived, recency);
+CREATE INDEX IF NOT EXISTS idx_composerHeaders_1 ON composerHeaders (recency, composerId);
+";
+
+/// Per-workspace `state.vscdb` table Cursor reads chat selection from.
+pub const LOCAL_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerHeader {
@@ -69,6 +99,42 @@ pub fn load_headers_for_workspace(
         .collect())
 }
 
+pub fn load_header(conn: &Connection, composer_id: &str) -> Result<Option<ComposerHeader>> {
+    if composer_headers_table(conn)? {
+        let mut stmt = conn.prepare_cached(
+            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
+             recency, checkpointAt, value, subagentTypeName \
+             FROM composerHeaders WHERE composerId = ?1",
+        )?;
+        return stmt
+            .query_row(params![composer_id], map_row)
+            .optional()
+            .context("failed to read composerHeaders");
+    }
+    Ok(load_legacy_headers(conn)?
+        .into_iter()
+        .find(|header| header.composer_id == composer_id))
+}
+
+fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComposerHeader> {
+    let value: Option<String> = row.get(8)?;
+    let value = value.unwrap_or_default();
+    let title = title_from_value(&value);
+    Ok(ComposerHeader {
+        composer_id: row.get(0)?,
+        workspace_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        created_at: row.get(2)?,
+        last_updated_at: row.get(3)?,
+        is_archived: flag(row.get(4)?),
+        is_subagent: flag(row.get(5)?),
+        recency: row.get(6)?,
+        checkpoint_at: row.get(7)?,
+        title,
+        value,
+        subagent_type_name: row.get(9)?,
+    })
+}
+
 fn load_headers_table(
     conn: &Connection,
     workspace_id: Option<&str>,
@@ -88,23 +154,6 @@ fn load_headers_table(
     let mut stmt = conn
         .prepare(sql)
         .context("failed to prepare composerHeaders query")?;
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ComposerHeader> {
-        let value: String = row.get(8)?;
-        let title = title_from_value(&value);
-        Ok(ComposerHeader {
-            composer_id: row.get(0)?,
-            workspace_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            created_at: row.get(2)?,
-            last_updated_at: row.get(3)?,
-            is_archived: flag(row.get(4)?),
-            is_subagent: flag(row.get(5)?),
-            recency: row.get(6)?,
-            checkpoint_at: row.get(7)?,
-            title,
-            value,
-            subagent_type_name: row.get(9)?,
-        })
-    };
     let rows = if let Some(workspace_id) = workspace_id {
         stmt.query_map(params![workspace_id], map_row)?
     } else {
@@ -190,30 +239,11 @@ fn flag(value: Option<i64>) -> bool {
 }
 
 pub fn ensure_global_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);
-         CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
-         CREATE TABLE IF NOT EXISTS composerHeaders (
-            composerId TEXT PRIMARY KEY,
-            workspaceId TEXT,
-            createdAt INTEGER,
-            lastUpdatedAt INTEGER,
-            isArchived INTEGER,
-            isSubagent INTEGER,
-            recency INTEGER,
-            checkpointAt INTEGER,
-            value TEXT,
-            subagentTypeName TEXT
-         );
-         CREATE INDEX IF NOT EXISTS idx_composerHeaders_0
-            ON composerHeaders (workspaceId, isSubagent, isArchived, recency);",
-    )
-    .context("failed to ensure global schema")?;
-    Ok(())
+    conn.execute_batch(GLOBAL_SCHEMA)
+        .context("failed to ensure global schema")
 }
 
 pub fn ensure_local_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);")
-        .context("failed to ensure local schema")?;
-    Ok(())
+    conn.execute_batch(LOCAL_SCHEMA)
+        .context("failed to ensure local schema")
 }

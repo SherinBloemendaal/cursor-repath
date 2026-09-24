@@ -228,9 +228,21 @@ pub const FLAGS: &[Flag] = &[
     ),
     flag(
         "",
-        "--move-chats",
+        "--move",
         "",
         "With split or combine, move chats instead of copying them",
+    ),
+    flag(
+        "",
+        "--copy",
+        "",
+        "With combine, keep chats in the sources (the default)",
+    ),
+    flag(
+        "",
+        "--overwrite",
+        "",
+        "With import, replace chats that already exist",
     ),
     flag(
         "",
@@ -589,6 +601,7 @@ mod tests {
         for flag in FLAGS {
             assert!(text.contains(flag.long), "{}", flag.long);
         }
+        assert!(!text.contains("--move-chats"));
         assert!(text.contains(crate::update::REPO_URL));
         assert!(!text.contains('\u{1b}'));
         assert!(help_text(Theme::colored(), 100).contains('\u{1b}'));

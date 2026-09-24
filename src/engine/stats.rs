@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
+use super::fsops::dir_size;
 use super::view::{display_name, header_workspace, kind_cell, workspace_name};
-use super::{Kind, Runtime, dir_size, discover};
+use super::{Kind, Runtime, discover, open_global_ro};
 use crate::cursor::registry::{ComposerHeader, load_headers};
 use crate::engine::db;
 use crate::ui::{self, Align, Sheet, Theme};
@@ -67,11 +68,7 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
         }
     }
     by_kind.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label().cmp(b.0.label())));
-    let conn = if rt.layout.global_db().exists() {
-        Some(db::open_ro(&rt.layout.global_db())?)
-    } else {
-        None
-    };
+    let conn = open_global_ro(rt)?;
     let headers = match &conn {
         Some(conn) => load_headers(conn)?,
         None => Vec::new(),

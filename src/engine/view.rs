@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Kind, Workspace};
 use crate::cursor::registry::ComposerHeader;
+use crate::cursor::workspace::is_workspace_file;
 use crate::ui::{self, Align, Sheet, Theme};
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,9 @@ pub fn display_name(kind: Option<&Kind>, path: Option<&Path>, id: &str) -> Strin
     match kind {
         Some(Kind::EmptyWindow) => "empty window".to_string(),
         Some(Kind::Unsaved) => format!("unsaved {}", unsaved_stamp(path, id)),
+        Some(Kind::Remote) => path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| id.to_string()),
         Some(Kind::Folder | Kind::CodeWorkspace) | None => path
             .map(|path| ui::home_relative(&path.display().to_string()))
             .unwrap_or_else(|| id.to_string()),
@@ -79,25 +83,36 @@ pub fn header_workspace(header: &ComposerHeader) -> (Option<Kind>, Option<PathBu
     if id == "empty-window" {
         return (Some(Kind::EmptyWindow), None);
     }
-    let path = serde_json::from_str::<Value>(&header.value)
+    let target = serde_json::from_str::<Value>(&header.value)
         .ok()
         .and_then(|json| {
             let identifier = json.get("workspaceIdentifier")?;
-            ["uri", "configPath"].iter().find_map(|key| {
-                identifier
-                    .get(*key)
-                    .and_then(|value| value.get("fsPath"))
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-            })
+            [("uri", false), ("configPath", true)]
+                .into_iter()
+                .find_map(|(key, config)| {
+                    let value = identifier.get(key)?;
+                    let scheme = value
+                        .get("scheme")
+                        .and_then(Value::as_str)
+                        .unwrap_or("file");
+                    let remote = !scheme.eq_ignore_ascii_case("file");
+                    let field = if remote { "path" } else { "fsPath" };
+                    let path = value.get(field).and_then(Value::as_str)?;
+                    Some((PathBuf::from(path), config, remote))
+                })
         });
-    match path {
-        Some(path) => {
-            let text = path.to_string_lossy().to_string();
-            (
-                Some(super::classify(id, Some(&text), Some(&path))),
-                Some(path),
-            )
+    match target {
+        Some((path, _, true)) => (Some(Kind::Remote), Some(path)),
+        Some((path, false, false)) => (Some(Kind::Folder), Some(path)),
+        Some((path, true, false)) => {
+            let untitled =
+                path.file_name().and_then(|name| name.to_str()) == Some("workspace.json");
+            let kind = if untitled && is_workspace_file(&path) {
+                Kind::Unsaved
+            } else {
+                Kind::CodeWorkspace
+            };
+            (Some(kind), Some(path))
         }
         None if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) => {
             (Some(Kind::Unsaved), None)
@@ -123,7 +138,7 @@ enum Destination {
 
 fn destination(workspace: &Workspace) -> Destination {
     match workspace.kind {
-        Kind::Unsaved | Kind::EmptyWindow => Destination::None,
+        Kind::Unsaved | Kind::EmptyWindow | Kind::Remote => Destination::None,
         Kind::Folder | Kind::CodeWorkspace if workspace.destination_missing => Destination::Missing,
         Kind::Folder | Kind::CodeWorkspace => Destination::Present,
     }
@@ -137,6 +152,7 @@ pub fn kind_cell(theme: Theme, kind: Option<&Kind>) -> Cell {
                 Kind::Folder => (Some(Color::Blue), &[Attribute::Bold]),
                 Kind::CodeWorkspace => (Some(Color::Magenta), &[Attribute::Bold]),
                 Kind::Unsaved => (Some(Color::Yellow), &[Attribute::Bold]),
+                Kind::Remote => (Some(Color::Green), &[Attribute::Bold]),
                 Kind::EmptyWindow => (None, &[Attribute::Dim]),
             };
             theme.cell(format!("{bullet} {}", kind.label()), color, attributes)
@@ -734,6 +750,26 @@ mod tests {
             r#"{"workspaceIdentifier":{"configPath":{"fsPath":"/tmp/r/resolved.code-workspace"}}}"#,
         );
         assert_eq!(header_workspace(&config).0, Some(Kind::CodeWorkspace));
+        let untitled = header(
+            "9d95c4710638ebad3cb7aaa3bec9a067",
+            r#"{"workspaceIdentifier":{"configPath":{"fsPath":"/x/Cursor/Workspaces/1778826556058/workspace.json"}}}"#,
+        );
+        let (kind, path) = header_workspace(&untitled);
+        assert_eq!(kind, Some(Kind::Unsaved));
+        assert_eq!(
+            display_name(kind.as_ref(), path.as_deref(), "x"),
+            "unsaved 1778826556058"
+        );
+        let remote = header(
+            "5f1c0e2a9b7d4c3e8f6a1b2c3d4e5f60",
+            r#"{"workspaceIdentifier":{"uri":{"scheme":"vscode-remote","authority":"ssh-remote+box","path":"/srv/app"}}}"#,
+        );
+        let (kind, path) = header_workspace(&remote);
+        assert_eq!(kind, Some(Kind::Remote));
+        assert_eq!(
+            display_name(kind.as_ref(), path.as_deref(), "x"),
+            "/srv/app"
+        );
         let unsaved = header(
             "1780204438555",
             r#"{"workspaceIdentifier":{"id":"1780204438555"}}"#,
