@@ -1,0 +1,219 @@
+//! Chat registry: `composerHeaders` table, with the legacy ItemTable key as fallback.
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
+
+pub const LEGACY_HEADERS_KEY: &str = "composer.composerHeaders";
+pub const LOCAL_COMPOSER_DATA_KEY: &str = "composer.composerData";
+
+pub const COMPOSER_PREFIXES: &[&str] = &[
+    "bubbleId:",
+    "checkpointId:",
+    "codeBlockDiff:",
+    "codeBlockPartialInlineDiffFates:",
+    "messageRequestContext:",
+    "ofsContent:",
+];
+
+pub const COMPOSER_EXACT_PREFIXES: &[&str] = &["composerData:", "composerVirtualRowHeights:"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerHeader {
+    pub composer_id: String,
+    pub workspace_id: String,
+    pub created_at: Option<i64>,
+    pub last_updated_at: Option<i64>,
+    pub is_archived: bool,
+    pub is_subagent: bool,
+    pub recency: Option<i64>,
+    pub checkpoint_at: Option<i64>,
+    pub value: String,
+    pub subagent_type_name: Option<String>,
+    pub title: Option<String>,
+}
+
+pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .context("failed to query sqlite_master")?;
+    Ok(count > 0)
+}
+
+pub fn composer_headers_table(conn: &Connection) -> Result<bool> {
+    table_exists(conn, "composerHeaders")
+}
+
+/// Read registry rows. Uses `composerHeaders` when that table exists, otherwise the legacy key.
+pub fn load_headers(conn: &Connection) -> Result<Vec<ComposerHeader>> {
+    if composer_headers_table(conn)? {
+        return load_headers_table(conn, None);
+    }
+    load_legacy_headers(conn)
+}
+
+pub fn load_headers_for_workspace(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<ComposerHeader>> {
+    if composer_headers_table(conn)? {
+        return load_headers_table(conn, Some(workspace_id));
+    }
+    Ok(load_legacy_headers(conn)?
+        .into_iter()
+        .filter(|header| header.workspace_id == workspace_id)
+        .collect())
+}
+
+fn load_headers_table(
+    conn: &Connection,
+    workspace_id: Option<&str>,
+) -> Result<Vec<ComposerHeader>> {
+    let sql = match workspace_id {
+        Some(_) => {
+            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
+             recency, checkpointAt, value, subagentTypeName \
+             FROM composerHeaders WHERE workspaceId = ?1"
+        }
+        None => {
+            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
+             recency, checkpointAt, value, subagentTypeName \
+             FROM composerHeaders"
+        }
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .context("failed to prepare composerHeaders query")?;
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ComposerHeader> {
+        let value: String = row.get(8)?;
+        let title = title_from_value(&value);
+        Ok(ComposerHeader {
+            composer_id: row.get(0)?,
+            workspace_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            created_at: row.get(2)?,
+            last_updated_at: row.get(3)?,
+            is_archived: flag(row.get(4)?),
+            is_subagent: flag(row.get(5)?),
+            recency: row.get(6)?,
+            checkpoint_at: row.get(7)?,
+            title,
+            value,
+            subagent_type_name: row.get(9)?,
+        })
+    };
+    let rows = if let Some(workspace_id) = workspace_id {
+        stmt.query_map(params![workspace_id], map_row)?
+    } else {
+        stmt.query_map([], map_row)?
+    };
+    rows.collect::<Result<Vec<_>, _>>()
+        .context("failed to read composerHeaders")
+}
+
+fn load_legacy_headers(conn: &Connection) -> Result<Vec<ComposerHeader>> {
+    if !table_exists(conn, "ItemTable")? {
+        return Ok(Vec::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            params![LEGACY_HEADERS_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read legacy composer.composerHeaders")?;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    parse_legacy(&raw)
+}
+
+pub fn parse_legacy(raw: &str) -> Result<Vec<ComposerHeader>> {
+    let json: Value = serde_json::from_str(raw).context("legacy composer headers are not json")?;
+    let Some(composers) = json.get("allComposers").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut headers = Vec::new();
+    for composer in composers {
+        let Some(composer_id) = composer.get("composerId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let workspace_id = composer
+            .pointer("/workspaceIdentifier/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        headers.push(ComposerHeader {
+            composer_id: composer_id.to_string(),
+            workspace_id,
+            created_at: composer.get("createdAt").and_then(|v| v.as_i64()),
+            last_updated_at: composer.get("lastUpdatedAt").and_then(|v| v.as_i64()),
+            is_archived: composer
+                .get("isArchived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            is_subagent: composer
+                .get("isSubagent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            recency: composer.get("recency").and_then(|v| v.as_i64()),
+            checkpoint_at: composer.get("checkpointAt").and_then(|v| v.as_i64()),
+            value: composer.to_string(),
+            subagent_type_name: composer
+                .get("subagentTypeName")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            title: title_from_value(&composer.to_string()),
+        });
+    }
+    Ok(headers)
+}
+
+fn title_from_value(value: &str) -> Option<String> {
+    let Ok(json) = serde_json::from_str::<Value>(value) else {
+        return None;
+    };
+    json.get("name")
+        .or_else(|| json.get("title"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn flag(value: Option<i64>) -> bool {
+    value.unwrap_or(0) != 0
+}
+
+pub fn ensure_global_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE IF NOT EXISTS composerHeaders (
+            composerId TEXT PRIMARY KEY,
+            workspaceId TEXT,
+            createdAt INTEGER,
+            lastUpdatedAt INTEGER,
+            isArchived INTEGER,
+            isSubagent INTEGER,
+            recency INTEGER,
+            checkpointAt INTEGER,
+            value TEXT,
+            subagentTypeName TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_composerHeaders_0
+            ON composerHeaders (workspaceId, isSubagent, isArchived, recency);",
+    )
+    .context("failed to ensure global schema")?;
+    Ok(())
+}
+
+pub fn ensure_local_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);")
+        .context("failed to ensure local schema")?;
+    Ok(())
+}

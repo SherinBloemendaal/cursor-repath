@@ -1,0 +1,4 @@
+target/
+.env
+*.tar.gz
+.cursor/
