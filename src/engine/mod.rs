@@ -753,6 +753,10 @@ fn preflight(
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "fsblkcnt_t is u32 on macOS and u64 on Linux"
+)]
 fn free_bytes(path: &Path) -> Option<u64> {
     let text = path.to_string_lossy();
     let c_path = std::ffi::CString::new(text.as_bytes()).ok()?;
