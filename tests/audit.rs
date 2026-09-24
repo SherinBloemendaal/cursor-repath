@@ -42,8 +42,8 @@ fn without_own_state(
 #[test]
 fn code_workspace_mv_hashes_the_lowercased_config_path() {
     let home = cursor_home();
-    let source = home.root.join("Proj/Src.code-workspace");
-    let dest = home.root.join("Other/App.code-workspace");
+    let source = native(&home.root, "Proj/Src.code-workspace");
+    let dest = native(&home.root, "Other/App.code-workspace");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(dest.parent().unwrap()).unwrap();
     fs::write(&source, "{\"folders\":[]}").unwrap();
@@ -761,8 +761,8 @@ fn import_rejects_traversal_ids_and_entries() {
 #[test]
 fn mv_project_moves_the_real_folder_and_keeps_its_identity() {
     let home = cursor_home();
-    let from = home.root.join("code/app");
-    let to = home.root.join("work/app");
+    let from = native(&home.root, "code/app");
+    let to = native(&home.root, "work/app");
     fs::create_dir_all(&from).unwrap();
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     fs::write(from.join("main.rs"), "fn main() {}").unwrap();
@@ -839,8 +839,8 @@ impl CollideAfterRename {
 #[test]
 fn collision_after_project_rename_rolls_back_every_step() {
     let home = cursor_home();
-    let from = home.root.join("code/app");
-    let to = home.root.join("work/app");
+    let from = native(&home.root, "code/app");
+    let to = native(&home.root, "work/app");
     fs::create_dir_all(&from).unwrap();
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     fs::write(from.join("main.rs"), "fn main() {}").unwrap();
@@ -932,10 +932,10 @@ impl CollideSecond {
 fn failure_on_the_second_item_rolls_back_the_first() {
     let home = cursor_home();
     let sep = std::path::MAIN_SEPARATOR;
-    let one = home.root.join("noble/one");
-    let two = home.root.join("noble/two");
-    let dest_one = home.root.join("resolute/one");
-    let dest_two = home.root.join("resolute/two");
+    let one = native(&home.root, "noble/one");
+    let two = native(&home.root, "noble/two");
+    let dest_one = native(&home.root, "resolute/one");
+    let dest_two = native(&home.root, "resolute/two");
     for dir in [&one, &two, &dest_one, &dest_two] {
         fs::create_dir_all(dir).unwrap();
     }
@@ -1066,7 +1066,7 @@ fn rich_home() -> Rich {
     let home = cursor_home();
     let src = home.root.join("src");
     let dest = home.root.join("dest");
-    let fresh = home.root.join("fresh/app");
+    let fresh = native(&home.root, "fresh/app");
     let api = home.root.join("api");
     for dir in [&src, &dest, &api, &fresh.parent().unwrap().to_path_buf()] {
         fs::create_dir_all(dir).unwrap();

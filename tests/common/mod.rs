@@ -26,6 +26,13 @@ pub fn disable_update_check() {
     });
 }
 
+/// `base` joined with a `/`-separated path using the platform separator, as Cursor stores paths.
+pub fn native(base: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 pub fn cursor_home() -> Home {
     disable_update_check();
     let tmp = TempDir::new().unwrap();
@@ -43,7 +50,7 @@ pub fn install_layout(root: &Path, name: &str, cursor_root: PathBuf) -> Layout {
     let layout = Layout {
         name: name.to_string(),
         cursor_root,
-        projects_dir: root.join("dot-cursor/projects"),
+        projects_dir: native(root, "dot-cursor/projects"),
         crepath_home: root.join("dot-crepath"),
     };
     fs::create_dir_all(layout.workspace_storage()).unwrap();

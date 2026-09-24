@@ -35,9 +35,9 @@ fn machine() -> Machine {
         "resolved",
         home.root.join("dot-cursor-resolved"),
     );
-    let app = home.root.join("code/app");
-    let api = home.root.join("code/api");
-    let shared = home.root.join("code/shared");
+    let app = native(&home.root, "code/app");
+    let api = native(&home.root, "code/api");
+    let shared = native(&home.root, "code/shared");
     for dir in [&app, &api, &shared] {
         fs::create_dir_all(dir).unwrap();
     }
@@ -71,7 +71,7 @@ fn machine() -> Machine {
         fs::write(dir.join(format!("{id}.jsonl")), id).unwrap();
     }
     fs::create_dir_all(slug.join("terminals")).unwrap();
-    fs::write(slug.join("terminals/1.txt"), "term").unwrap();
+    fs::write(native(&slug, "terminals/1.txt"), "term").unwrap();
     Machine {
         home,
         other,
@@ -278,7 +278,7 @@ fn write_commands_infer_the_installation_and_leave_the_other_alone() {
     let machine = machine();
     let rt = idle(&machine);
     let default_before = tree(&machine.home.layout.cursor_root);
-    let moved = machine.home.root.join("code/api-moved");
+    let moved = native(&machine.home.root, "code/api-moved");
     fs::create_dir_all(&moved).unwrap();
     run(
         &rt,
@@ -347,7 +347,7 @@ fn ambiguous_targets_need_a_profile() {
 fn mixing_installations_is_refused() {
     let machine = machine();
     let rt = idle(&machine);
-    let target = machine.home.root.join("code/together");
+    let target = native(&machine.home.root, "code/together");
     fs::create_dir_all(&target).unwrap();
     let before = snapshot(&machine.home);
     let err = run(
@@ -401,7 +401,7 @@ fn mv_of_a_shared_folder_moves_only_this_installations_transcripts() {
     let machine = machine();
     let rt = idle(&machine);
     let resolved_before = tree(&machine.other.cursor_root);
-    let dest = machine.home.root.join("code/shared-moved");
+    let dest = native(&machine.home.root, "code/shared-moved");
     fs::create_dir_all(&dest).unwrap();
     run(
         &rt,
@@ -422,11 +422,11 @@ fn mv_of_a_shared_folder_moves_only_this_installations_transcripts() {
     assert!(old.join("agent-transcripts").join(E).is_dir());
     assert!(!new.join("agent-transcripts").join(E).exists());
     assert_eq!(
-        fs::read_to_string(old.join("terminals/1.txt")).unwrap(),
+        fs::read_to_string(native(&old, "terminals/1.txt")).unwrap(),
         "term"
     );
     assert_eq!(
-        fs::read_to_string(new.join("terminals/1.txt")).unwrap(),
+        fs::read_to_string(native(&new, "terminals/1.txt")).unwrap(),
         "term"
     );
     assert_eq!(resolved_before, tree(&machine.other.cursor_root));
@@ -441,7 +441,7 @@ fn mv_project_of_a_shared_folder_warns_about_the_other_installation() {
     let machine = machine();
     let rt = with_profile(&idle(&machine), "default").unwrap();
     let resolved_before = tree(&machine.other.cursor_root);
-    let dest = machine.home.root.join("code/shared-renamed");
+    let dest = native(&machine.home.root, "code/shared-renamed");
     let report = move_paths(
         &rt,
         &[("hash-shared".into(), dest.display().to_string())],
@@ -479,8 +479,8 @@ fn mv_of_a_folder_only_this_installation_uses_moves_the_whole_slug() {
     let projects = &machine.home.layout.projects_dir;
     let old = projects.join(slug_of(&machine.app));
     fs::create_dir_all(old.join("agent-transcripts").join(A)).unwrap();
-    fs::create_dir_all(old.join("agent-transcripts/orphan")).unwrap();
-    let dest = machine.home.root.join("code/app-moved");
+    fs::create_dir_all(native(&old, "agent-transcripts/orphan")).unwrap();
+    let dest = native(&machine.home.root, "code/app-moved");
     fs::create_dir_all(&dest).unwrap();
     run(
         &rt,
@@ -494,7 +494,7 @@ fn mv_of_a_folder_only_this_installation_uses_moves_the_whole_slug() {
     let new = projects.join(slug_of(&dest));
     assert!(!old.exists());
     assert!(new.join("agent-transcripts").join(A).is_dir());
-    assert!(new.join("agent-transcripts/orphan").is_dir());
+    assert!(native(&new, "agent-transcripts/orphan").is_dir());
 }
 
 fn archive_names(file: &Path) -> Vec<String> {
@@ -537,9 +537,10 @@ fn export_of_a_shared_folder_leaves_out_other_installations_transcripts() {
     assert!(!names.iter().any(|name| name.contains(E)), "{names:?}");
     let solo = machine.home.root.join("app.crepath");
     let projects = &machine.home.layout.projects_dir;
-    let orphan = projects
-        .join(slug_of(&machine.app))
-        .join("agent-transcripts/orphan");
+    let orphan = native(
+        &projects.join(slug_of(&machine.app)),
+        "agent-transcripts/orphan",
+    );
     fs::create_dir_all(&orphan).unwrap();
     fs::write(orphan.join("o.jsonl"), "o").unwrap();
     run(&rt, &["export", "hash-app", &solo.display().to_string()]).unwrap();
@@ -554,7 +555,7 @@ fn export_of_a_shared_folder_leaves_out_other_installations_transcripts() {
 fn import_writes_only_into_the_chosen_installation() {
     let machine = machine();
     let rt = idle(&machine);
-    let folder = machine.home.root.join("code/lib");
+    let folder = native(&machine.home.root, "code/lib");
     fs::create_dir_all(&folder).unwrap();
     let hash = compute_workspace_hash(&folder).unwrap();
     write_folder_workspace(&machine.home.layout, &hash, &folder);
@@ -595,8 +596,8 @@ fn import_writes_only_into_the_chosen_installation() {
 fn installations_from_older_cursor_builds_are_read_and_written() {
     let machine = machine();
     let legacy_root = machine.home.root.join("dot-cursor-legacy");
-    fs::create_dir_all(legacy_root.join("User/globalStorage")).unwrap();
-    rusqlite::Connection::open(legacy_root.join("User/globalStorage/state.vscdb"))
+    fs::create_dir_all(native(&legacy_root, "User/globalStorage")).unwrap();
+    rusqlite::Connection::open(native(&legacy_root, "User/globalStorage/state.vscdb"))
         .unwrap()
         .execute_batch(
             "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, \
@@ -605,7 +606,7 @@ fn installations_from_older_cursor_builds_are_read_and_written() {
         )
         .unwrap();
     let legacy = install_layout(&machine.home.root, "legacy", legacy_root);
-    let old = machine.home.root.join("code/old");
+    let old = native(&machine.home.root, "code/old");
     fs::create_dir_all(&old).unwrap();
     write_folder_workspace(&legacy, "hash-old", &old);
     global(&legacy)
@@ -628,7 +629,7 @@ fn installations_from_older_cursor_builds_are_read_and_written() {
             .contains("│ legacy ")
     );
 
-    let folder = machine.home.root.join("code/lib");
+    let folder = native(&machine.home.root, "code/lib");
     fs::create_dir_all(&folder).unwrap();
     let hash = compute_workspace_hash(&folder).unwrap();
     write_folder_workspace(&machine.home.layout, &hash, &folder);
@@ -676,8 +677,14 @@ fn probed(machine: &Machine, listing: Result<Vec<ProcessInfo>, String>) -> Runti
     )
 }
 
+fn next_key() -> String {
+    native(Path::new("code"), "app-next")
+        .to_string_lossy()
+        .to_string()
+}
+
 fn try_mv(machine: &Machine, rt: &Runtime) -> anyhow::Result<engine::Report> {
-    let dest = machine.home.root.join("code/app-next");
+    let dest = native(&machine.home.root, "code/app-next");
     fs::create_dir_all(&dest).unwrap();
     move_paths(
         rt,
@@ -727,7 +734,7 @@ fn the_running_guard_names_every_instance() {
         "{err}"
     );
     let mut after = snapshot(&machine.home);
-    after.remove("code/app-next");
+    after.remove(&next_key());
     assert_same(&before, &after, "guarded mv");
 }
 
@@ -765,7 +772,7 @@ fn an_unreadable_process_table_blocks_writes_but_not_reads() {
         "{err}"
     );
     let mut after = snapshot(&machine.home);
-    after.remove("code/app-next");
+    after.remove(&next_key());
     assert_same(&before, &after, "mv with an unreadable process table");
     assert_eq!(list_rows(&rt, false).unwrap().len(), 4);
     engine::render_stats(&rt, Theme::plain()).unwrap();
