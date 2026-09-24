@@ -3,19 +3,15 @@
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use comfy_table::{Attribute, Cell, CellAlignment, Color};
-use rusqlite::Connection;
 use serde_json::Value;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::Path;
 
-use super::fsops::dir_size;
-use super::view::{display_name, header_workspace, kind_cell, workspace_name};
-use super::{Kind, Runtime, filtered_workspaces, open_global_ro, user_profiles};
+use super::Kind;
+use super::Runtime;
+use super::facts::{ChatFacts, ChatUsage, InstallFacts, read_live};
+use super::view::{display_name, kind_cell, workspace_name};
 use crate::cursor::install;
-use crate::cursor::registry::{ComposerHeader, load_headers};
-use crate::engine::db;
 use crate::ui::{self, Align, Sheet, Theme};
 
 const TOP: usize = 10;
@@ -52,6 +48,23 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.token_chats += other.token_chats;
     }
+
+    fn add_chat(&mut self, chat: &ChatUsage) {
+        if chat.cost_cents > 0 || chat.requests > 0 {
+            self.cost_cents += chat.cost_cents;
+            self.requests += chat.requests;
+            self.cost_chats += 1;
+        }
+        if chat.context_tokens > 0 {
+            self.context_tokens += chat.context_tokens;
+            self.context_chats += 1;
+        }
+        if chat.input_tokens > 0 || chat.output_tokens > 0 {
+            self.input_tokens += chat.input_tokens;
+            self.output_tokens += chat.output_tokens;
+            self.token_chats += 1;
+        }
+    }
 }
 
 /// One installation, or one VS Code profile inside it.
@@ -84,18 +97,22 @@ pub struct Stats {
     pub workspace_dbs: Vec<Named>,
 }
 
-pub fn render(rt: &Runtime, theme: Theme) -> Result<String> {
-    Ok(render_stats(theme, &collect(rt)?))
+pub fn collect(rt: &Runtime) -> Result<Stats> {
+    let mut found = Vec::new();
+    for scoped in rt.scope() {
+        let facts = read_live(&scoped, false)?;
+        found.push((scoped, facts));
+    }
+    Ok(gather(&found))
 }
 
-pub fn collect(rt: &Runtime) -> Result<Stats> {
-    let scopes = rt.scope();
+pub fn gather(found: &[(Runtime, InstallFacts)]) -> Stats {
     let mut stats = Stats {
-        installations: scopes.len(),
+        installations: found.len(),
         ..Stats::default()
     };
-    for scoped in &scopes {
-        collect_into(scoped, scopes.len() > 1, &mut stats)?;
+    for (scoped, facts) in found {
+        collect_into(scoped, facts, found.len() > 1, &mut stats);
     }
     stats
         .by_kind
@@ -106,10 +123,10 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
     stats
         .workspace_dbs
         .sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.name.cmp(&b.name)));
-    Ok(stats)
+    stats
 }
 
-fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
+fn collect_into(rt: &Runtime, facts: &InstallFacts, labelled: bool, stats: &mut Stats) {
     let install = rt.layout.name.as_str();
     let tag = |name: String| {
         if labelled {
@@ -118,8 +135,12 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
             name
         }
     };
-    let workspaces = filtered_workspaces(rt, false)?;
-    for workspace in &workspaces {
+    let workspaces: Vec<_> = facts
+        .workspaces_for(rt)
+        .into_iter()
+        .map(|facts| (&facts.workspace, facts.local_db))
+        .collect();
+    for (workspace, _) in &workspaces {
         match stats
             .by_kind
             .iter_mut()
@@ -129,34 +150,42 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
             None => stats.by_kind.push((workspace.kind.clone(), 1)),
         }
     }
-    let conn = open_global_ro(rt)?;
-    let mut headers = match &conn {
-        Some(conn) => load_headers(conn)?,
-        None => Vec::new(),
-    };
+    let mut chats: Vec<&ChatFacts> = facts.chats.iter().collect();
     if rt.profile.is_some() {
         let ids: HashSet<&str> = workspaces
             .iter()
-            .map(|workspace| workspace.id.as_str())
+            .map(|(workspace, _)| workspace.id.as_str())
             .collect();
-        headers.retain(|header| ids.contains(header.workspace_id.as_str()));
+        chats.retain(|chat| ids.contains(chat.workspace_id.as_str()));
     }
-    let chats = headers.iter().filter(|header| !header.is_subagent).count();
-    let subagents = headers.iter().filter(|header| header.is_subagent).count();
+    let top_level = chats.iter().filter(|chat| !chat.is_subagent).count();
+    let subagents = chats.iter().filter(|chat| chat.is_subagent).count();
     stats.workspaces += workspaces.len();
-    stats.chats += chats;
+    stats.chats += top_level;
     stats.subagents += subagents;
-    stats.archived += headers.iter().filter(|header| header.is_archived).count();
-    let mut per_workspace: BTreeMap<String, (usize, &ComposerHeader)> = BTreeMap::new();
-    for header in &headers {
-        if header.is_subagent {
+    stats.archived += chats.iter().filter(|chat| chat.is_archived).count();
+    let mut per_workspace: BTreeMap<String, (usize, &ChatFacts)> = BTreeMap::new();
+    let mut found = Usage {
+        conversations: chats.len(),
+        ..Usage::default()
+    };
+    for chat in &chats {
+        if let Some(usage) = &chat.usage {
+            found.add_chat(usage);
+            if !chat.is_subagent
+                && let Some(model) = &usage.model
+            {
+                *stats.models.entry(model.clone()).or_default() += 1;
+            }
+        }
+        if chat.is_subagent {
             continue;
         }
         per_workspace
-            .entry(header.workspace_id.clone())
-            .or_insert((0, header))
+            .entry(chat.workspace_id.clone())
+            .or_insert((0, chat))
             .0 += 1;
-        if let Some(created) = header.created_at
+        if let Some(created) = chat.created_at
             && let Some(stamp) = Utc.timestamp_millis_opt(created).single()
         {
             *stats
@@ -165,23 +194,10 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
                 .or_default() += 1;
         }
     }
-    let (found, models) = match &conn {
-        Some(conn) => usage(conn, &headers)?,
-        None => (
-            Usage {
-                conversations: headers.len(),
-                ..Usage::default()
-            },
-            BTreeMap::new(),
-        ),
-    };
     stats.usage.absorb(&found);
-    for (model, count) in models {
-        *stats.models.entry(model).or_default() += count;
-    }
     let known: HashMap<&str, (String, Kind)> = workspaces
         .iter()
-        .map(|workspace| {
+        .map(|(workspace, _)| {
             (
                 workspace.id.as_str(),
                 (workspace_name(workspace), workspace.kind.clone()),
@@ -190,13 +206,13 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
         .collect();
     stats
         .busiest
-        .extend(per_workspace.into_iter().map(|(id, (count, header))| {
+        .extend(per_workspace.into_iter().map(|(id, (count, chat))| {
             let (name, kind) = match known.get(id.as_str()) {
                 Some((name, kind)) => (name.clone(), Some(kind.clone())),
-                None => {
-                    let (kind, path) = header_workspace(header);
-                    (display_name(kind.as_ref(), path.as_deref(), &id), kind)
-                }
+                None => (
+                    display_name(chat.origin_kind.as_ref(), chat.origin_path.as_deref(), &id),
+                    chat.origin_kind.clone(),
+                ),
             };
             Named {
                 name: tag(name),
@@ -206,18 +222,18 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
         }));
     stats
         .workspace_dbs
-        .extend(workspaces.iter().filter_map(|workspace| {
-            file_len(&workspace.dir.join("state.vscdb")).map(|size| Named {
+        .extend(workspaces.iter().filter_map(|(workspace, local_db)| {
+            local_db.map(|size| Named {
                 name: tag(workspace_name(workspace)),
                 kind: Some(workspace.kind.clone()),
                 value: size,
             })
         }));
-    let global_db = file_len(&rt.layout.global_db());
+    let global_db = facts.global_db;
     if let Some(size) = global_db {
         stats.global_db = Some(stats.global_db.unwrap_or(0) + size);
     }
-    let root = ui::home_relative(&rt.layout.cursor_root.display().to_string());
+    let root = ui::home_relative(&facts.root.display().to_string());
     let name = match &rt.profile {
         Some(profile) if profile != install::DEFAULT => format!("{install}/{profile}"),
         _ => install.to_string(),
@@ -226,36 +242,35 @@ fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
         name,
         root: root.clone(),
         workspaces: workspaces.len(),
-        chats,
+        chats: top_level,
         subagents,
         global_db,
         user_profile: false,
     });
     if rt.profile.is_some() {
-        return Ok(());
+        return;
     }
-    for profile in user_profiles(rt)? {
+    for profile in &facts.profiles {
         let ids: HashSet<&str> = workspaces
             .iter()
-            .filter(|workspace| workspace.profile == profile.name)
-            .map(|workspace| workspace.id.as_str())
+            .filter(|(workspace, _)| workspace.profile == profile.name)
+            .map(|(workspace, _)| workspace.id.as_str())
             .collect();
-        let owned: Vec<&ComposerHeader> = headers
+        let owned: Vec<&&ChatFacts> = chats
             .iter()
-            .filter(|header| ids.contains(header.workspace_id.as_str()))
+            .filter(|chat| ids.contains(chat.workspace_id.as_str()))
             .collect();
         stats.user_profiles += 1;
         stats.profiles.push(ProfileRow {
             name: format!("{install}/{}", profile.name),
             root: root.clone(),
             workspaces: ids.len(),
-            chats: owned.iter().filter(|header| !header.is_subagent).count(),
-            subagents: owned.iter().filter(|header| header.is_subagent).count(),
+            chats: owned.iter().filter(|chat| !chat.is_subagent).count(),
+            subagents: owned.iter().filter(|chat| chat.is_subagent).count(),
             global_db: None,
             user_profile: true,
         });
     }
-    Ok(())
 }
 
 fn left(theme: Theme, text: impl std::fmt::Display) -> Cell {
@@ -824,38 +839,6 @@ fn top_model(models: &BTreeMap<String, usize>) -> Option<(&str, usize)> {
         .map(|(name, count)| (name.as_str(), *count))
 }
 
-fn usage(
-    conn: &Connection,
-    headers: &[ComposerHeader],
-) -> Result<(Usage, BTreeMap<String, usize>)> {
-    let mut usage = Usage {
-        conversations: headers.len(),
-        ..Usage::default()
-    };
-    let mut models = BTreeMap::new();
-    for header in headers {
-        let Some(raw) = db::read_text(conn, &format!("composerData:{}", header.composer_id))?
-        else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        add_usage(&mut usage, &json);
-        if header.is_subagent {
-            continue;
-        }
-        if let Some(name) = json
-            .pointer("/modelConfig/modelName")
-            .and_then(|v| v.as_str())
-            .or_else(|| json.get("modelConfig").and_then(|v| v.as_str()))
-        {
-            *models.entry(name.to_string()).or_default() += 1;
-        }
-    }
-    Ok((usage, models))
-}
-
 pub fn add_usage(usage: &mut Usage, json: &Value) {
     let field = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
     if let Some(entries) = json.get("usageData").and_then(Value::as_object) {
@@ -890,16 +873,6 @@ pub fn add_usage(usage: &mut Usage, json: &Value) {
             usage.token_chats += 1;
         }
     }
-}
-
-fn file_len(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|meta| meta.len()).or_else(|| {
-        if path.is_dir() {
-            dir_size(path).ok()
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]

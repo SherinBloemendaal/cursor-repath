@@ -71,6 +71,7 @@ Any command with no arguments opens the picker (space toggles, Enter once, then 
 | `crepath import [FILE] [TO]`            | Restore a `.crepath` archive. `TO` attaches it to another folder.                            |
 | `crepath history`                       | Local log at `~/.crepath/history.jsonl`. Entries older than 30 days are pruned on write.     |
 | `crepath stats`                         | Profiles, workspaces, chats, disk, usage cost, context size, message tokens, models.         |
+| `crepath cache clear\|scan\|stats`      | Clear, rescan, or inspect the persistent index behind `ls`, `stats`, and the pickers.        |
 | `crepath help [COMMAND]`                | Colored help, or every option of one command.                                                |
 | `crepath update`                        | Download and install the latest release for this OS.                                         |
 | `crepath github`                        | Open the GitHub repository in the browser.                                                   |
@@ -115,6 +116,8 @@ A missing destination is a warning. That item is skipped.
 | `--move`      | `split`, `combine` | Move the chats instead of copying them.               |
 | `--copy`      | `combine`          | Keep the chats in the sources (the default).          |
 | `--overwrite` | `import`           | Replace chats that already exist instead of skipping. |
+| `--fresh`     | `ls`, `stats`      | Read live data, then refresh the index.               |
+| `--full`      | `cache scan`       | Rebuild the index from scratch.                       |
 
 ### Examples
 
@@ -124,6 +127,20 @@ crepath save 1765558213752 ~/projects/foo
 crepath split 5af0e30872454aba2290760e07cae157 ~/projects/api ~/projects/frontend
 crepath combine ~/projects/api 7b86a000ce7c6377c39429a3bd7e2080 9d95c4710638ebad3cb7aaa3bec9a067 --move
 ```
+
+## Index
+
+`ls`, `ls <id>`, `stats`, the pickers, and the split auto-suggest read from a persistent index in `~/.crepath/index.db`. The first `ls` or `stats` for an installation builds it in the foreground. Later runs render from the index at once, print a dim `as of HH:MM` note on stderr, and start `crepath __refresh-index` detached in the background, at most once a minute. That refresh opens Cursor's databases read-only, re-reads only the files whose size or modification time changed (`state.vscdb` and its `-wal`, `storage.json`, and each workspace's `workspace.json` and `state.vscdb`), and reads chat data only for chats whose header changed. `~/.crepath/index.lock` lets one refresh run at a time, and `~/.crepath/refresh.log` keeps its output, trimmed to the newest 64 KB once it passes 256 KB.
+
+Write commands never trust the index: they read live data before and while they write. After a successful write the installation is marked dirty, so the next read refreshes it first.
+
+`--fresh` bypasses the index for one `ls` or `stats` and refreshes it afterwards. `CREPATH_NO_INDEX=1` turns the index off completely. `CREPATH_HOME` moves crepath's state directory (history, backups, index) away from `~/.crepath`.
+
+| Command                                | What it does                                                                                    |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `crepath cache stats`                  | Index size and schema, last scan and stale sources per installation, and the background status. |
+| `crepath cache scan [--profile NAME]`  | Refresh now with progress bars. `--full` rebuilds. `-n` only lists what is stale.               |
+| `crepath cache clear [--profile NAME]` | Delete the index, or only one installation's rows. One confirmation. Refused during a refresh.  |
 
 ## Split assignment
 

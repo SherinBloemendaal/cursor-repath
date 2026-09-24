@@ -50,8 +50,15 @@ pub fn global_storage_dir() -> Result<PathBuf> {
     Ok(cursor_config_dir()?.join("User").join("globalStorage"))
 }
 
-/// Local crepath state: history and backups.
+/// Local crepath state: history, backups, and the index. `CREPATH_HOME` overrides it.
 pub fn crepath_home() -> Result<PathBuf> {
+    crepath_home_from(std::env::var_os("CREPATH_HOME"))
+}
+
+pub fn crepath_home_from(overridden: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(path) = overridden.filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
     let home = dirs::home_dir().context("Could not determine home directory")?;
     Ok(home.join(".crepath"))
 }
@@ -117,6 +124,17 @@ mod tests {
             "globalStorage"
         );
         assert_eq!(components[len - 2].as_os_str().to_string_lossy(), "User");
+    }
+
+    #[test]
+    fn crepath_home_can_be_overridden() {
+        assert_eq!(
+            crepath_home_from(Some("/tmp/state".into())).unwrap(),
+            PathBuf::from("/tmp/state")
+        );
+        let default = crepath_home_from(None).unwrap();
+        assert!(default.ends_with(".crepath"));
+        assert_eq!(crepath_home_from(Some("".into())).unwrap(), default);
     }
 
     #[test]

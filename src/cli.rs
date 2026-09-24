@@ -13,10 +13,9 @@ use crate::config;
 use crate::cursor::install::{self, DEFAULT};
 use crate::cursor::process::NativeProcesses;
 use crate::engine::{
-    self, FixedProbe, Layout, Runtime, SystemProbe, Workspace, combine_workspaces, copy_paths,
-    discover, export_workspace, import_archive, list_workspaces, move_paths, record_history,
-    reindex, remove_targets, save_unsaved, show_history, show_stats, split_workspace,
-    suggest_split,
+    self, FixedProbe, Layout, Runtime, SystemProbe, Workspace, cache, combine_workspaces,
+    copy_paths, export_workspace, import_archive, index, move_paths, record_history, reindex,
+    remove_targets, save_unsaved, show_history, split_workspace, suggest_split,
 };
 use crate::ui::{self, ColorMode, Theme, validation};
 
@@ -80,7 +79,11 @@ pub enum Command {
     /// Show the local command log.
     History(CommonArgs),
     /// Show profiles, chats, tokens, and models.
-    Stats(CommonArgs),
+    Stats(StatsArgs),
+    /// Inspect, rebuild, or clear the persistent index.
+    Cache(CacheArgs),
+    #[command(name = "__refresh-index", hide = true)]
+    RefreshIndex,
     /// Download and install the latest release.
     Update,
     /// Open the GitHub repository in the browser.
@@ -172,6 +175,60 @@ pub struct ListArgs {
     #[command(flatten)]
     pub common: CommonArgs,
     pub id: Option<String>,
+    /// Read live data instead of the index, then refresh the index.
+    #[arg(long)]
+    pub fresh: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StatsArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Read live data instead of the index, then refresh the index.
+    #[arg(long)]
+    pub fresh: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub action: CacheAction,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CacheAction {
+    /// Delete the index, or with --profile only that installation's rows.
+    Clear(CommonArgs),
+    /// Refresh the index now, re-reading only what changed.
+    Scan(ScanArgs),
+    /// Show index size, freshness, and the background refresh.
+    Stats(CommonArgs),
+}
+
+impl CacheAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Clear(_) => "clear",
+            Self::Scan(_) => "scan",
+            Self::Stats(_) => "stats",
+        }
+    }
+
+    fn common(&self) -> &CommonArgs {
+        match self {
+            Self::Clear(common) | Self::Stats(common) => common,
+            Self::Scan(args) => &args.common,
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ScanArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Ignore what is stored and rebuild from scratch.
+    #[arg(long)]
+    pub full: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -219,6 +276,13 @@ pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
             return Ok(());
         }
     };
+    if matches!(command, Command::RefreshIndex) {
+        let rt = match runtime {
+            Some(runtime) => runtime,
+            None => production_runtime(&common_of(&command))?,
+        };
+        return index::background(&rt);
+    }
     if matches!(command, Command::Update) {
         return crate::update::run_update();
     }
@@ -257,10 +321,15 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Ls(args) => {
-            print!(
-                "{}",
-                list_workspaces(rt, args.common.unsaved, args.id.as_deref())?
-            );
+            let rt = if args.fresh { rt.fresh() } else { rt.clone() };
+            let (text, note) = engine::render_workspaces_noted(
+                &rt,
+                args.common.unsaved,
+                args.id.as_deref(),
+                Theme::stdout(),
+            )?;
+            print!("{text}");
+            print_note(note);
             Ok(())
         }
         Command::Rm(args) => {
@@ -317,14 +386,56 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
             print!("{}", show_history(rt)?);
             Ok(())
         }
-        Command::Stats(_) => {
-            print!("{}", show_stats(rt)?);
+        Command::Stats(args) => {
+            let rt = if args.fresh { rt.fresh() } else { rt.clone() };
+            let (text, note) = engine::render_stats_noted(&rt, Theme::stdout())?;
+            print!("{text}");
+            print_note(note);
             Ok(())
         }
+        Command::Cache(args) => run_cache(rt, &args.action),
+        Command::RefreshIndex => index::background(rt),
         Command::Update => crate::update::run_update(),
         Command::Github => crate::update::open_github(),
         Command::Help(args) => show_help(args.command.as_deref()),
     }
+}
+
+fn print_note(note: Option<index::Note>) {
+    if let Some(note) = note {
+        let theme = Theme::stderr();
+        eprintln!("{}", ui::hint_line(theme, &note.text(theme)));
+    }
+}
+
+fn run_cache(rt: &Runtime, action: &CacheAction) -> Result<()> {
+    match action {
+        CacheAction::Clear(_) => {
+            let plan = cache::clear_plan(rt)?;
+            if !plan.items.is_empty() && !rt.dry_run && !ui::confirm(&plan.question, rt.yes)? {
+                bail!("aborted");
+            }
+            let report = cache::clear(rt, &plan)?;
+            finish(rt, "Cache clear", report);
+        }
+        CacheAction::Scan(_) if rt.dry_run => {
+            print!(
+                "{}",
+                cache::render_stale(Theme::stdout(), &cache::collect(rt)?)
+            );
+        }
+        CacheAction::Scan(args) => {
+            let result = cache::scan(rt, args.full)?;
+            print!("{}", cache::render_scan(Theme::stdout(), &result));
+        }
+        CacheAction::Stats(_) => {
+            print!(
+                "{}",
+                cache::render_stats(Theme::stdout(), &cache::collect(rt)?, index::now_ms())
+            );
+        }
+    }
+    Ok(())
 }
 
 fn show_help(command: Option<&str>) -> Result<()> {
@@ -752,7 +863,7 @@ fn pick_from(
     let labelled = scopes.len() > 1;
     let mut found: Vec<(Runtime, Workspace)> = Vec::new();
     for scoped in scopes {
-        for workspace in discover(&scoped)? {
+        for workspace in engine::picker_workspaces(&scoped)? {
             let wanted = scoped
                 .profile
                 .as_ref()
@@ -927,16 +1038,25 @@ fn common_of(command: &Command) -> CommonArgs {
         Command::Ls(args) => args.common.clone(),
         Command::Export(args) => args.common.clone(),
         Command::Import(args) => args.common.clone(),
-        Command::History(args) | Command::Stats(args) => args.clone(),
-        Command::Update | Command::Github | Command::Help(_) => CommonArgs {
-            dry_run: false,
-            yes: true,
-            profile: None,
-            replace: Vec::new(),
-            regex: false,
-            unsaved: false,
-        },
+        Command::History(args) => args.clone(),
+        Command::Stats(args) => args.common.clone(),
+        Command::Cache(args) => args.action.common().clone(),
+        Command::Update | Command::Github | Command::Help(_) | Command::RefreshIndex => {
+            CommonArgs {
+                dry_run: false,
+                yes: true,
+                profile: None,
+                replace: Vec::new(),
+                regex: false,
+                unsaved: false,
+            }
+        }
     }
+}
+
+/// Index settings from `CREPATH_NO_INDEX`.
+pub fn index_config() -> Option<index::Config> {
+    index::Config::from_env(std::env::var("CREPATH_NO_INDEX").ok().as_deref())
 }
 
 pub fn production_runtime(common: &CommonArgs) -> Result<Runtime> {
@@ -969,6 +1089,7 @@ pub fn production_runtime(common: &CommonArgs) -> Result<Runtime> {
             profile: None,
             probe: Arc::new(SystemProbe::new(NativeProcesses, roots)),
             quiet: false,
+            index: index_config(),
         },
         common,
     )
@@ -1074,6 +1195,7 @@ pub fn test_runtime(layout: Layout, running: bool, dry_run: bool) -> Runtime {
         profile: None,
         probe: Arc::new(FixedProbe(running)),
         quiet: true,
+        index: None,
     }
 }
 
@@ -1091,6 +1213,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Import(_) => "import",
         Command::History(_) => "history",
         Command::Stats(_) => "stats",
+        Command::Cache(_) => "cache",
+        Command::RefreshIndex => index::REFRESH_COMMAND,
         Command::Update => "update",
         Command::Github => "github",
         Command::Help(_) => "help",
@@ -1123,10 +1247,12 @@ fn command_args(command: &Command) -> Vec<String> {
             args.file.clone().unwrap_or_default(),
             args.to.clone().unwrap_or_default(),
         ],
+        Command::Cache(args) => vec![args.action.name().to_string()],
         Command::History(_)
         | Command::Stats(_)
         | Command::Update
         | Command::Github
-        | Command::Help(_) => Vec::new(),
+        | Command::Help(_)
+        | Command::RefreshIndex => Vec::new(),
     }
 }

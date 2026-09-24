@@ -142,7 +142,9 @@ pub fn run<'r, T>(
     })();
     match outcome {
         Ok(value) => {
+            let touched = session.journal.chat_ids();
             session.close();
+            super::index::after_write(rt, &touched);
             Ok(value)
         }
         Err(err) => Err(session.abort(err)),
@@ -183,6 +185,7 @@ mod tests {
             profile: None,
             probe: Arc::new(FixedProbe(false)),
             quiet: true,
+            index: None,
         }
     }
 

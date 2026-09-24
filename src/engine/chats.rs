@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::db::{self, Target};
 use super::fsops::{SpaceNeeds, write_atomic};
+use super::index;
 use super::local;
 use super::session::{self, Session};
 use super::{
@@ -18,6 +19,7 @@ use super::{
 use crate::cursor::registry::{self, load_header};
 use crate::cursor::rewrite::{Boundary, Replacement, Rewriter, path_replacements};
 use crate::cursor::uri::{Platform, normalize_path, uri_path};
+use crate::ui;
 
 #[derive(Debug, Clone)]
 pub struct SplitSuggestion {
@@ -43,11 +45,38 @@ pub fn suggest_split(
     };
     let headers = db::headers(&conn, &source.id)?;
     let roots: Vec<PathBuf> = targets.iter().map(|path| normalize_path(path)).collect();
-    for header in headers.iter().filter(|header| !header.is_subagent) {
+    let chats: Vec<&registry::ComposerHeader> = headers
+        .iter()
+        .filter(|header| !header.is_subagent)
+        .collect();
+    let ids: Vec<String> = chats
+        .iter()
+        .map(|header| header.composer_id.clone())
+        .collect();
+    let cached = index::cached_evidence(rt, &ids);
+    let mut read = Vec::new();
+    let spinner = ui::spinner("Matching chats to targets", rt.quiet);
+    for (done, header) in chats.iter().enumerate() {
+        spinner.set_message(&format!(
+            "Matching chats to targets ({}/{})",
+            done + 1,
+            chats.len()
+        ));
+        let paths = match cached.get(&header.composer_id) {
+            Some((stamp, paths)) if *stamp == header.last_updated_at => paths.clone(),
+            _ => {
+                let paths = evidence(&conn, &header.composer_id)?;
+                read.push((
+                    header.composer_id.clone(),
+                    header.last_updated_at,
+                    paths.clone(),
+                ));
+                paths
+            }
+        };
         let mut hits = Vec::new();
-        for raw in db::touched_paths(&conn, &header.composer_id)? {
-            if let Some(path) = materialize_path(&raw)
-                && let Some(target) = longest_target(&path, &roots)
+        for path in &paths {
+            if let Some(target) = longest_target(path, &roots)
                 && !hits.contains(&target)
             {
                 hits.push(target);
@@ -59,6 +88,8 @@ pub fn suggest_split(
             assigned.insert(header.composer_id.clone(), hits);
         }
     }
+    drop(spinner);
+    index::keep_evidence(rt, &source.id, &read);
     for header in &headers {
         titles.insert(header.composer_id.clone(), header.title.clone());
     }
@@ -67,6 +98,20 @@ pub fn suggest_split(
         unassigned,
         titles,
     })
+}
+
+/// Every local path a chat touched, deduplicated in first-seen order.
+fn evidence(conn: &Connection, composer_id: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in db::touched_paths(conn, composer_id)? {
+        if let Some(path) = materialize_path(&raw)
+            && seen.insert(path.clone())
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -29,6 +29,21 @@ pub const COMPOSER_EXACT_PREFIXES: &[&str] = &[
 /// Content-addressed blobs shared between chats.
 pub const BLOB_PREFIX: &str = "agentKv:blob:";
 
+/// Chat id of a composer-keyed `cursorDiskKV` key.
+pub fn composer_of(key: &str) -> Option<&str> {
+    if let Some(id) = COMPOSER_EXACT_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+    {
+        return Some(id);
+    }
+    COMPOSER_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(id, _)| id)
+}
+
 /// Families keyed `<prefix><workspaceId>:<rest>`.
 pub const WORKSPACE_PREFIXES: &[&str] = &["inlineDiff:", "patch-graph:"];
 

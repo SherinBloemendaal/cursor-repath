@@ -1,9 +1,12 @@
 //! Shared Cursor repath engine.
 
 mod archive;
+pub mod cache;
 mod chats;
 mod db;
+pub mod facts;
 mod fsops;
+pub mod index;
 mod journal;
 mod local;
 mod repath;
@@ -131,9 +134,19 @@ pub struct Runtime {
     pub profile: Option<String>,
     pub probe: Arc<dyn Probe>,
     pub quiet: bool,
+    pub index: Option<index::Config>,
 }
 
 impl Runtime {
+    /// The same runtime with the index bypassed for reads and refreshed afterwards.
+    pub fn fresh(&self) -> Runtime {
+        let mut rt = self.clone();
+        if let Some(config) = &mut rt.index {
+            config.fresh = true;
+        }
+        rt
+    }
+
     pub fn check(&self) -> Result<()> {
         let instances = self.probe.instances().map_err(|err| {
             ui::hinted(
@@ -233,6 +246,18 @@ impl Kind {
             Self::EmptyWindow => "empty-window",
             Self::Remote => "remote",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::Folder,
+            Self::CodeWorkspace,
+            Self::Unsaved,
+            Self::EmptyWindow,
+            Self::Remote,
+        ]
+        .into_iter()
+        .find(|kind| kind.label() == label)
     }
 }
 
@@ -362,18 +387,84 @@ pub fn render_workspaces(
     detail: Option<&str>,
     theme: Theme,
 ) -> Result<String> {
+    Ok(render_workspaces_noted(rt, unsaved_only, detail, theme)?.0)
+}
+
+/// `ls` output, plus the "as of" note when it came from the index.
+pub fn render_workspaces_noted(
+    rt: &Runtime,
+    unsaved_only: bool,
+    detail: Option<&str>,
+    theme: Theme,
+) -> Result<(String, Option<index::Note>)> {
+    if let Some(loaded) = index::load(rt)? {
+        let text = render_loaded(&loaded, unsaved_only, detail, theme)?;
+        return Ok((text, loaded.note));
+    }
+    let text = render_live(rt, unsaved_only, detail, theme)?;
+    if rt.index.as_ref().is_some_and(|config| config.fresh) {
+        index::sync(rt)?;
+    }
+    Ok((text, None))
+}
+
+fn matches_spec(workspace: &Workspace, id: &str, wanted: &Path) -> bool {
+    workspace.id == id || workspace.path.as_deref() == Some(wanted)
+}
+
+fn render_loaded(
+    loaded: &index::Loaded,
+    unsaved_only: bool,
+    detail: Option<&str>,
+    theme: Theme,
+) -> Result<String> {
+    let Some(id) = detail else {
+        let mut rows: Vec<ListRow> = loaded
+            .installs
+            .iter()
+            .flat_map(|(scoped, facts)| facts.list_rows(scoped, unsaved_only))
+            .collect();
+        sort_rows(&mut rows);
+        return Ok(view::render_list(theme, &rows));
+    };
+    let wanted = normalize_path(Path::new(id));
+    let mut out = Vec::new();
+    for (scoped, facts) in &loaded.installs {
+        let Some(row) = facts
+            .list_rows(scoped, unsaved_only)
+            .into_iter()
+            .find(|row| matches_spec(&row.workspace, id, &wanted))
+        else {
+            continue;
+        };
+        let headers = facts.headers_of(&row.workspace.id);
+        out.push(view::render_detail(theme, &row, &headers));
+    }
+    if out.is_empty() {
+        anyhow::bail!("no workspace matches {id}");
+    }
+    Ok(out.join("\n"))
+}
+
+fn render_live(
+    rt: &Runtime,
+    unsaved_only: bool,
+    detail: Option<&str>,
+    theme: Theme,
+) -> Result<String> {
     let _spinner = ui::spinner("Scanning workspaces", rt.quiet);
     if let Some(id) = detail {
         let wanted = normalize_path(Path::new(id));
         let mut out = Vec::new();
         for scoped in rt.scope() {
             let mut workspaces = filtered_workspaces(&scoped, unsaved_only)?;
-            let Some(index) = workspaces.iter().position(|workspace| {
-                workspace.id == id || workspace.path.as_ref().is_some_and(|path| path == &wanted)
-            }) else {
+            let Some(position) = workspaces
+                .iter()
+                .position(|workspace| matches_spec(workspace, id, &wanted))
+            else {
                 continue;
             };
-            let workspace = workspaces.swap_remove(index);
+            let workspace = workspaces.swap_remove(position);
             let conn = open_global_ro(&scoped)?;
             let headers = match &conn {
                 Some(conn) => db::headers(conn, &workspace.id)?,
@@ -501,8 +592,23 @@ pub fn show_stats(rt: &Runtime) -> Result<String> {
 }
 
 pub fn render_stats(rt: &Runtime, theme: Theme) -> Result<String> {
-    let _spinner = ui::spinner("Reading chat usage", rt.quiet);
-    stats::render(rt, theme)
+    Ok(render_stats_noted(rt, theme)?.0)
+}
+
+/// `stats` output, plus the "as of" note when it came from the index.
+pub fn render_stats_noted(rt: &Runtime, theme: Theme) -> Result<(String, Option<index::Note>)> {
+    if let Some(loaded) = index::load(rt)? {
+        let text = stats::render_stats(theme, &stats::gather(&loaded.installs));
+        return Ok((text, loaded.note));
+    }
+    let text = {
+        let _spinner = ui::spinner("Reading chat usage", rt.quiet);
+        stats::render_stats(theme, &stats::collect(rt)?)
+    };
+    if rt.index.as_ref().is_some_and(|config| config.fresh) {
+        index::sync(rt)?;
+    }
+    Ok((text, None))
 }
 
 pub fn record_history(
@@ -524,45 +630,68 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
     let mut found = Vec::new();
     let root = rt.layout.workspace_storage();
     if root.exists() {
-        let profiles = profile_map(rt)?;
-        let unsaved_root = normalize_path(&rt.layout.unsaved_root());
+        let profiles = profile_map_of(&install::read_storage(&rt.layout.storage_json())?);
         for entry in fs::read_dir(&root)?.flatten() {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let dir = entry.path();
-            let id = entry.file_name().to_string_lossy().to_string();
-            let uri = workspace::read_workspace_target_uri(&dir)?;
-            let path = uri.as_deref().and_then(|uri| {
-                uri::parse_file_uri(Platform::current(), uri)
-                    .map(|path| normalize_path(Path::new(&path)))
-                    .or_else(|| uri_path(uri))
-            });
-            let kind = classify(&dir, uri.as_deref(), path.as_deref(), &unsaved_root);
-            let profile = uri
-                .as_ref()
-                .and_then(|value| profiles.get(value).cloned())
-                .unwrap_or_else(|| DEFAULT.to_string());
-            let destination_missing = match kind {
-                Kind::Folder | Kind::CodeWorkspace => {
-                    path.as_ref().is_none_or(|path| !path.exists())
-                }
-                Kind::Unsaved | Kind::EmptyWindow | Kind::Remote => false,
-            };
-            found.push(Workspace {
-                id,
-                dir,
-                kind,
-                uri,
-                path,
-                install: rt.layout.name.clone(),
-                profile,
-                destination_missing,
-            });
+            found.push(read_workspace(
+                &rt.layout,
+                entry.path(),
+                entry.file_name().to_string_lossy().to_string(),
+                &profiles,
+            )?);
         }
     }
     found.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(found)
+}
+
+/// Workspaces for a picker: the index when it is current, otherwise a live scan.
+pub fn picker_workspaces(rt: &Runtime) -> Result<Vec<Workspace>> {
+    match index::workspaces(rt) {
+        Some(found) => Ok(found),
+        None => discover(rt),
+    }
+}
+
+/// One `workspaceStorage/<id>` directory as `discover` reports it.
+pub fn read_workspace(
+    layout: &Layout,
+    dir: PathBuf,
+    id: String,
+    profiles: &HashMap<String, String>,
+) -> Result<Workspace> {
+    let unsaved_root = normalize_path(&layout.unsaved_root());
+    let uri = workspace::read_workspace_target_uri(&dir)?;
+    let path = uri.as_deref().and_then(|uri| {
+        uri::parse_file_uri(Platform::current(), uri)
+            .map(|path| normalize_path(Path::new(&path)))
+            .or_else(|| uri_path(uri))
+    });
+    let kind = classify(&dir, uri.as_deref(), path.as_deref(), &unsaved_root);
+    let profile = uri
+        .as_ref()
+        .and_then(|value| profiles.get(value).cloned())
+        .unwrap_or_else(|| DEFAULT.to_string());
+    let destination_missing = destination_missing(&kind, path.as_deref());
+    Ok(Workspace {
+        id,
+        dir,
+        kind,
+        uri,
+        path,
+        install: layout.name.clone(),
+        profile,
+        destination_missing,
+    })
+}
+
+pub fn destination_missing(kind: &Kind, path: Option<&Path>) -> bool {
+    match kind {
+        Kind::Folder | Kind::CodeWorkspace => path.is_none_or(|path| !path.exists()),
+        Kind::Unsaved | Kind::EmptyWindow | Kind::Remote => false,
+    }
 }
 
 /// VS Code user data profiles of the runtime's installation.
@@ -572,9 +701,9 @@ pub fn user_profiles(rt: &Runtime) -> Result<Vec<install::UserProfile>> {
     )?))
 }
 
-fn profile_map(rt: &Runtime) -> Result<HashMap<String, String>> {
-    let json = install::read_storage(&rt.layout.storage_json())?;
-    let profiles = install::user_profiles(&json);
+/// Workspace URI to VS Code profile name, from `storage.json`.
+pub fn profile_map_of(json: &Value) -> HashMap<String, String> {
+    let profiles = install::user_profiles(json);
     let mut map = HashMap::new();
     if let Some(workspaces) = json
         .pointer("/profileAssociations/workspaces")
@@ -585,7 +714,7 @@ fn profile_map(rt: &Runtime) -> Result<HashMap<String, String>> {
             map.insert(uri.clone(), install::profile_name(&profiles, id));
         }
     }
-    Ok(map)
+    map
 }
 
 fn classify(dir: &Path, uri: Option<&str>, path: Option<&Path>, unsaved_root: &Path) -> Kind {

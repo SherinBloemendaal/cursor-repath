@@ -182,6 +182,18 @@ impl Journal {
         self.recorded.contains(&(table, key.to_string()))
     }
 
+    /// Every chat whose header or composer-keyed rows this command touched.
+    pub fn chat_ids(&self) -> HashSet<String> {
+        self.recorded
+            .iter()
+            .filter_map(|(table, key)| match table {
+                Table::Headers => Some(key.clone()),
+                Table::Disk => crate::cursor::registry::composer_of(key).map(str::to_string),
+                Table::Item => None,
+            })
+            .collect()
+    }
+
     /// Record the current image of one row before its first change.
     pub fn record_row(&mut self, conn: &Connection, table: Table, key: &str) -> Result<()> {
         if self.is_recorded(table, key) {

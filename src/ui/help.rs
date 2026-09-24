@@ -174,6 +174,13 @@ pub const GROUPS: &[Group] = &[
                 "Rebuild registry refs, rewrite stale paths, clear caches",
             ),
             entry(
+                ("◫", "%"),
+                "cache",
+                &[],
+                "clear|scan|stats",
+                "Clear, rescan, or inspect the persistent index",
+            ),
+            entry(
                 ("✦", "*"),
                 "update",
                 &[],
@@ -248,6 +255,18 @@ pub const FLAGS: &[Flag] = &[
         "--overwrite",
         "",
         "With import, replace chats that already exist",
+    ),
+    flag(
+        "",
+        "--fresh",
+        "",
+        "With ls or stats, read live data and refresh the index",
+    ),
+    flag(
+        "",
+        "--full",
+        "",
+        "With cache scan, rebuild the index from scratch",
     ),
     flag(
         "",

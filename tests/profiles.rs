@@ -95,6 +95,7 @@ fn runtime_of(machine: &Machine, probe: Arc<dyn Probe>) -> Runtime {
         profile: None,
         probe,
         quiet: true,
+        index: None,
     }
 }
 

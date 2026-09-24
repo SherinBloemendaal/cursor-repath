@@ -23,6 +23,7 @@ pub fn disable_update_check() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
         std::env::set_var("CREPATH_NO_UPDATE_CHECK", "1");
+        std::env::set_var("CREPATH_NO_INDEX", "1");
     });
 }
 
@@ -77,6 +78,7 @@ pub fn runtime_with(layout: &Layout, probe: Arc<dyn Probe>, dry_run: bool) -> Ru
         profile: None,
         probe,
         quiet: true,
+        index: None,
     }
 }
 
