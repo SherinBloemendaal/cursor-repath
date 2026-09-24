@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/mai
 Pin a release with `bash -s`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.sh | bash -s v0.4.0
+curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.sh | bash -s v1.0.0
 ```
 
 The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTALL`). It adds that directory to your zsh, bash, or fish config when the line is missing. Run it again to upgrade in place.
@@ -24,7 +24,7 @@ The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTAL
 powershell -c "irm https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.ps1|iex"
 ```
 
-`$env:CREPATH_VERSION` pins a tag (`v0.4.0`). `$env:CREPATH_INSTALL` overrides the install directory (default `%USERPROFILE%\.crepath\bin`). The script adds that directory to the user PATH when it is missing.
+`$env:CREPATH_VERSION` pins a tag (`v1.0.0`). `$env:CREPATH_INSTALL` overrides the install directory (default `%USERPROFILE%\.crepath\bin`). The script adds that directory to the user PATH when it is missing.
 
 Published archives, checked against `SHA256SUMS` on the GitHub release:
 
@@ -72,6 +72,12 @@ Any command with no arguments opens the picker (space toggles, Enter once, then 
 | `crepath history` | Local log at `~/.crepath/history.jsonl`. Entries older than 30 days are pruned on write. |
 | `crepath stats` | Profiles, workspaces, chats, disk, tokens, models. |
 | `crepath help` | Colored help. |
+| `crepath update` | Download and install the latest release for this OS. |
+| `crepath github` | Open the GitHub repository in the browser. |
+
+`crepath update` checks `SHA256SUMS`, then replaces the binary in `$CREPATH_INSTALL` or `~/.crepath/bin`.
+
+`crepath github` opens https://github.com/SherinBloemendaal/cursor-repath.
 
 `mv` and `cp` change metadata only. `--project` also moves the real folder. `--project` is refused when the destination parent is missing.
 

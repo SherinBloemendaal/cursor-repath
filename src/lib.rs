@@ -13,3 +13,4 @@ pub mod config;
 pub mod cursor;
 pub mod engine;
 pub mod ui;
+pub mod update;

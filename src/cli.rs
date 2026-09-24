@@ -55,6 +55,10 @@ pub enum Command {
     History(CommonArgs),
     /// Show profiles, chats, tokens, and models.
     Stats(CommonArgs),
+    /// Download and install the latest release.
+    Update,
+    /// Open the GitHub repository in the browser.
+    Github,
     /// Show help.
     Help,
 }
@@ -159,9 +163,17 @@ pub fn run() -> Result<()> {
 
 pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
     let Some(command) = cli.command else {
+        crate::update::notify_if_outdated();
         ui::print_help();
         return Ok(());
     };
+    if matches!(command, Command::Update) {
+        return crate::update::run_update();
+    }
+    crate::update::notify_if_outdated();
+    if matches!(command, Command::Github) {
+        return crate::update::open_github();
+    }
     if matches!(command, Command::Help) {
         ui::print_help();
         return Ok(());
@@ -245,6 +257,8 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
             print!("{}", show_stats(rt)?);
             Ok(())
         }
+        Command::Update => crate::update::run_update(),
+        Command::Github => crate::update::open_github(),
         Command::Help => {
             ui::print_help();
             Ok(())
@@ -523,7 +537,7 @@ fn common_of(command: &Command) -> CommonArgs {
         Command::Export(args) => args.common.clone(),
         Command::Import(args) => args.common.clone(),
         Command::History(args) | Command::Stats(args) => args.clone(),
-        Command::Help => CommonArgs {
+        Command::Update | Command::Github | Command::Help => CommonArgs {
             dry_run: false,
             yes: true,
             profile: None,
@@ -574,6 +588,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Import(_) => "import",
         Command::History(_) => "history",
         Command::Stats(_) => "stats",
+        Command::Update => "update",
+        Command::Github => "github",
         Command::Help => "help",
     }
 }
@@ -604,6 +620,10 @@ fn command_args(command: &Command) -> Vec<String> {
             args.file.clone().unwrap_or_default(),
             args.to.clone().unwrap_or_default(),
         ],
-        Command::History(_) | Command::Stats(_) | Command::Help => Vec::new(),
+        Command::History(_)
+        | Command::Stats(_)
+        | Command::Update
+        | Command::Github
+        | Command::Help => Vec::new(),
     }
 }

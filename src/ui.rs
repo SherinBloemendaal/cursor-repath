@@ -183,6 +183,8 @@ pub fn print_help() {
   {}              local command log
   {}                profiles, chats, tokens, models
   {}                 this help
+  {}              install the latest release
+  {}              open the GitHub repository
 
 Shared flags: {} dry-run, {} skip the warning prompt, {} NAME,
 {} FROM TO, {}, {}.
@@ -222,6 +224,8 @@ split and combine copy unless {}.
         "history".cyan(),
         "stats".cyan(),
         "help".cyan(),
+        "update".cyan(),
+        "github".cyan(),
         "-n".yellow(),
         "-y".yellow(),
         "--profile".yellow(),

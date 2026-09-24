@@ -23,7 +23,15 @@ struct Home {
     layout: Layout,
 }
 
+fn disable_update_check() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("CREPATH_NO_UPDATE_CHECK", "1");
+    });
+}
+
 fn cursor_home() -> Home {
+    disable_update_check();
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
     let layout = Layout {
@@ -576,6 +584,7 @@ fn combine_copy_clones_rows_move_reassigns_and_dedup_skips() {
 
 #[test]
 fn registry_reads_composer_headers_and_falls_back() {
+    disable_update_check();
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     registry::ensure_global_schema(&conn).unwrap();
     conn.execute(
@@ -739,6 +748,7 @@ fn indexed_rewrite_touches_only_workspace_and_skips_sibling_prefix() {
 
 #[test]
 fn storage_json_full_walk_rewrites_known_fields() {
+    disable_update_check();
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("storage.json");
     let body = json!({
