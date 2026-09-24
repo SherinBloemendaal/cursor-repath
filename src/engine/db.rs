@@ -1,7 +1,7 @@
 //! Indexed global database reads and chat ownership changes.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +24,16 @@ pub fn open_rw(path: &std::path::Path) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
+    Ok(conn)
+}
+
+pub fn open_ro(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {} read-only", path.display()))?;
+    conn.pragma_update(None, "query_only", "ON")?;
     Ok(conn)
 }
 

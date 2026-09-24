@@ -1,6 +1,7 @@
 //! Release check, self-update, and the GitHub shortcut.
 
 use anyhow::{Context, Result, bail};
+use comfy_table::{Attribute, Color};
 use flate2::read::GzDecoder;
 use semver::Version;
 use serde::Deserialize;
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tar::Archive;
+
+use crate::ui::{self, Theme};
 
 pub const REPO_URL: &str = "https://github.com/SherinBloemendaal/cursor-repath";
 const LATEST_API: &str =
@@ -53,49 +56,113 @@ pub fn notify_if_outdated() {
     }) else {
         return;
     };
-    println!("{}", outdated_message(env!("CARGO_PKG_VERSION"), &latest));
+    ui::notice(&outdated_message(env!("CARGO_PKG_VERSION"), &latest));
 }
 
 pub fn run_update() -> Result<()> {
+    let theme = Theme::stdout();
+    ui::section("Checking for updates");
+    let spinner = ui::spinner("Asking GitHub for the latest release", false);
     let release = fetch_release(Duration::from_secs(30))?;
+    drop(spinner);
     let current = env!("CARGO_PKG_VERSION");
     let latest = display_version(&release.tag_name)?;
     if let Ok(path) = cache_path() {
         let _ = write_cache(&path, unix_now(), &latest);
     }
+    let icons = theme.icons();
     if compare_versions(&latest, current)? != Ordering::Greater {
-        println!("crepath {current} is up to date.");
+        println!(
+            "{}",
+            ui::panel(
+                theme,
+                vec![
+                    ("Installed", theme.cell(current, None, &[Attribute::Bold])),
+                    ("Latest", theme.cell(&latest, None, &[])),
+                    (
+                        "Status",
+                        theme.cell(
+                            format!("{} up to date", icons.check),
+                            Some(Color::Green),
+                            &[Attribute::Bold],
+                        ),
+                    ),
+                ],
+            )
+        );
         return Ok(());
     }
+    ui::section(&format!(
+        "Updating crepath {} {} {}",
+        theme.dim(current),
+        theme.arrow(),
+        theme.good(theme.bold(&latest))
+    ));
     let asset = current_asset_name()?;
     let archive_url = asset_url(&release, asset)?;
     let sums_url = asset_url(&release, "SHA256SUMS")?;
     let tmp = tempfile::tempdir().context("could not create a temporary directory")?;
     let archive_path = tmp.path().join(asset);
+    let spinner = ui::spinner(&format!("Downloading {asset}"), false);
     download(&archive_url, &archive_path, DOWNLOAD_TIMEOUT)
         .with_context(|| format!("download failed: {archive_url}"))?;
+    spinner.set_message("Downloading SHA256SUMS");
     let sums_path = tmp.path().join("SHA256SUMS");
     download(&sums_url, &sums_path, Duration::from_secs(30))
         .with_context(|| format!("download failed: {sums_url}"))?;
+    drop(spinner);
     let sums = fs::read_to_string(&sums_path).context("could not read SHA256SUMS")?;
     let dest = install_binary_path()?;
     install_verified_release(&archive_path, &sums, asset, &dest)?;
-    println!("updated crepath to {latest} ({})", dest.display());
+    println!(
+        "{}",
+        ui::panel(
+            theme,
+            vec![
+                ("Previous", theme.cell(current, None, &[Attribute::Dim])),
+                (
+                    "Installed",
+                    theme.cell(&latest, Some(Color::Green), &[Attribute::Bold]),
+                ),
+                ("Asset", theme.cell(asset, Some(Color::Cyan), &[])),
+                (
+                    "Checksum",
+                    theme.cell(
+                        format!("{} SHA-256 verified", icons.check),
+                        Some(Color::Green),
+                        &[],
+                    ),
+                ),
+                (
+                    "Location",
+                    theme.cell(dest.display(), Some(Color::Cyan), &[]),
+                ),
+            ],
+        )
+    );
+    ui::ok(&format!(
+        "Updated crepath to {}",
+        theme.good(theme.bold(&latest))
+    ));
     Ok(())
 }
 
 pub fn open_github() -> Result<()> {
+    let theme = Theme::stdout();
     let Some((program, prefix)) = browser_command(std::env::consts::OS) else {
-        println!("{REPO_URL}");
+        ui::info(&theme.path(REPO_URL));
         bail!("could not open {REPO_URL}");
     };
     let mut command = Command::new(program);
     command.args(prefix);
     command.arg(REPO_URL);
     match command.status() {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => {
+            ui::ok(&format!("Opened {}", theme.path(REPO_URL)));
+            Ok(())
+        }
         _ => {
-            println!("{REPO_URL}");
+            ui::info(&theme.path(REPO_URL));
             bail!("could not open {REPO_URL}");
         }
     }

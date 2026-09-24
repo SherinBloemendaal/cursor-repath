@@ -4,6 +4,9 @@
 //! It accesses locally stored data on your machine for personal use.
 //! See DISCLAIMER.md for details.
 
-fn main() -> anyhow::Result<()> {
-    crepath::cli::run()
+fn main() {
+    if let Err(err) = crepath::cli::run() {
+        crepath::ui::report_error(&err);
+        std::process::exit(1);
+    }
 }

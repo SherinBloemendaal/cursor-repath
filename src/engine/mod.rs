@@ -1,6 +1,7 @@
 //! Shared Cursor repath engine.
 
 mod db;
+mod view;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -20,9 +21,10 @@ use crate::cursor::registry::{self, ComposerHeader};
 use crate::cursor::rewrite::Replacement;
 use crate::cursor::storage::rewrite_storage_json;
 use crate::cursor::workspace::{self, compute_workspace_hash};
-use crate::ui::{self, DualProgress};
+use crate::ui::{self, DualProgress, Theme};
 
 pub use db::{rewrite_workspace, touched_paths};
+pub use view::{ListRow, sort_rows};
 
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -98,7 +100,10 @@ pub struct Runtime {
 impl Runtime {
     pub fn check(&self) -> Result<()> {
         if self.probe.running() {
-            bail!("Cursor is running. Close Cursor completely and retry.");
+            return Err(ui::hinted(
+                "Cursor is running.",
+                "Close Cursor completely and retry.",
+            ));
         }
         Ok(())
     }
@@ -529,17 +534,22 @@ pub fn remove_targets(rt: &Runtime, targets: &[String]) -> Result<Report> {
 }
 
 pub fn list_workspaces(rt: &Runtime, unsaved_only: bool, detail: Option<&str>) -> Result<String> {
-    let mut workspaces = discover(rt)?;
-    if let Some(profile) = &rt.profile {
-        workspaces.retain(|workspace| &workspace.profile == profile);
-    }
-    if unsaved_only {
-        workspaces.retain(|workspace| workspace.kind == Kind::Unsaved);
-    }
+    render_workspaces(rt, unsaved_only, detail, Theme::stdout())
+}
+
+pub fn render_workspaces(
+    rt: &Runtime,
+    unsaved_only: bool,
+    detail: Option<&str>,
+    theme: Theme,
+) -> Result<String> {
+    let _spinner = ui::spinner("Scanning workspaces", rt.quiet);
+    let mut workspaces = filtered_workspaces(rt, unsaved_only)?;
+    let conn = open_global_ro(rt)?;
     if let Some(id) = detail {
-        let workspace = workspaces
-            .into_iter()
-            .find(|workspace| {
+        let index = workspaces
+            .iter()
+            .position(|workspace| {
                 workspace.id == id
                     || workspace
                         .path
@@ -547,9 +557,67 @@ pub fn list_workspaces(rt: &Runtime, unsaved_only: bool, detail: Option<&str>) -
                         .is_some_and(|path| path.to_string_lossy() == id)
             })
             .with_context(|| format!("no workspace matches {id}"))?;
-        return detail_table(rt, &workspace);
+        let workspace = workspaces.swap_remove(index);
+        let headers = match &conn {
+            Some(conn) => db::headers(conn, &workspace.id)?,
+            None => Vec::new(),
+        };
+        let row = list_row(conn.as_ref(), workspace)?;
+        return Ok(view::render_detail(theme, &row, &headers));
     }
-    summary_table(rt, &workspaces)
+    let mut rows = workspaces
+        .into_iter()
+        .map(|workspace| list_row(conn.as_ref(), workspace))
+        .collect::<Result<Vec<_>>>()?;
+    sort_rows(&mut rows);
+    Ok(view::render_list(theme, &rows))
+}
+
+pub fn list_rows(rt: &Runtime, unsaved_only: bool) -> Result<Vec<ListRow>> {
+    let conn = open_global_ro(rt)?;
+    let mut rows = filtered_workspaces(rt, unsaved_only)?
+        .into_iter()
+        .map(|workspace| list_row(conn.as_ref(), workspace))
+        .collect::<Result<Vec<_>>>()?;
+    sort_rows(&mut rows);
+    Ok(rows)
+}
+
+fn filtered_workspaces(rt: &Runtime, unsaved_only: bool) -> Result<Vec<Workspace>> {
+    let mut workspaces = discover(rt)?;
+    if let Some(profile) = &rt.profile {
+        workspaces.retain(|workspace| &workspace.profile == profile);
+    }
+    if unsaved_only {
+        workspaces.retain(|workspace| workspace.kind == Kind::Unsaved);
+    }
+    Ok(workspaces)
+}
+
+fn open_global_ro(rt: &Runtime) -> Result<Option<Connection>> {
+    let path = rt.layout.global_db();
+    if path.exists() {
+        Ok(Some(db::open_ro(&path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn list_row(conn: Option<&Connection>, workspace: Workspace) -> Result<ListRow> {
+    let headers = match conn {
+        Some(conn) => db::headers(conn, &workspace.id)?,
+        None => Vec::new(),
+    };
+    let subagents = headers.iter().filter(|header| header.is_subagent).count();
+    let archived = headers.iter().filter(|header| header.is_archived).count();
+    let size = dir_size(&workspace.dir).unwrap_or(0);
+    Ok(ListRow {
+        chats: headers.len().saturating_sub(subagents),
+        subagents,
+        archived,
+        size,
+        workspace,
+    })
 }
 
 pub fn export_workspace(rt: &Runtime, target: &str, file: &Path) -> Result<Report> {
@@ -584,15 +652,26 @@ pub fn import_archive(rt: &Runtime, file: &Path, dest: Option<&Path>) -> Result<
 }
 
 pub fn show_history(rt: &Runtime) -> Result<String> {
+    render_history(rt, Theme::stdout())
+}
+
+pub fn render_history(rt: &Runtime, theme: Theme) -> Result<String> {
     let path = rt.layout.history_file();
-    if !path.exists() {
-        return Ok("No history yet.\n".to_string());
-    }
-    Ok(fs::read_to_string(path)?)
+    let raw = if path.exists() {
+        Some(fs::read_to_string(path)?)
+    } else {
+        None
+    };
+    Ok(view::render_history(theme, raw.as_deref()))
 }
 
 pub fn show_stats(rt: &Runtime) -> Result<String> {
-    stats::render(rt)
+    render_stats(rt, Theme::stdout())
+}
+
+pub fn render_stats(rt: &Runtime, theme: Theme) -> Result<String> {
+    let _spinner = ui::spinner("Reading chat usage", rt.quiet);
+    stats::render(rt, theme)
 }
 
 pub fn record_history(
@@ -622,7 +701,27 @@ fn repath(
         return Ok(report);
     }
     if !report.warnings.is_empty() && !rt.yes && !rt.quiet {
-        bail!("warnings need confirmation; pass -y to continue");
+        let rows: Vec<Vec<String>> = planned
+            .iter()
+            .map(|item| vec![item.source.id.clone(), item.dest.display().to_string()])
+            .collect();
+        print!(
+            "{}",
+            ui::validation(
+                Theme::stdout(),
+                match transfer {
+                    Transfer::Move => "Move plan",
+                    Transfer::Copy => "Copy plan",
+                },
+                &["workspace", "destination"],
+                &rows,
+                &report.warnings,
+            )
+        );
+        return Err(ui::hinted(
+            "warnings need confirmation",
+            "Pass -y to continue.",
+        ));
     }
     if rt.dry_run {
         for item in &planned {
@@ -799,7 +898,11 @@ fn plan_one(source: &Workspace, dest: &Path, project: bool, transfer: Transfer) 
 
 fn apply_plans(rt: &Runtime, planned: &[Planned], report: &mut Report) -> Result<()> {
     let backup = backup_plans(rt, planned)?;
-    let progress = DualProgress::new(planned.len() as u64, rt.quiet);
+    let label = match planned.first().map(|item| item.transfer) {
+        Some(Transfer::Copy) => "copy",
+        _ => "move",
+    };
+    let progress = DualProgress::new(label, planned.len() as u64, rt.quiet);
     for (index, item) in planned.iter().enumerate() {
         rt.check().inspect_err(|_| {
             restore_backup(&backup).ok();
@@ -1401,86 +1504,6 @@ fn require_workspace(rt: &Runtime, id: &str) -> Result<Workspace> {
 
 fn open_global(rt: &Runtime) -> Result<Connection> {
     db::ensure_db(&rt.layout.global_db())
-}
-
-fn summary_table(rt: &Runtime, workspaces: &[Workspace]) -> Result<String> {
-    let conn = if rt.layout.global_db().exists() {
-        Some(db::open_rw(&rt.layout.global_db())?)
-    } else {
-        None
-    };
-    let mut table = ui::table(&[
-        "profile",
-        "kind",
-        "path",
-        "chats",
-        "subagents",
-        "size",
-        "hash",
-        "dest",
-    ]);
-    for workspace in workspaces {
-        let (chats, subs) = match &conn {
-            Some(conn) => header_counts(conn, &workspace.id)?,
-            None => (0, 0),
-        };
-        let size = dir_size(&workspace.dir).unwrap_or(0);
-        table.add_row([
-            workspace.profile.clone(),
-            workspace.kind.label().to_string(),
-            workspace
-                .path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .or_else(|| workspace.uri.clone())
-                .unwrap_or_else(|| "-".to_string()),
-            chats.to_string(),
-            subs.to_string(),
-            ui::format_size(size),
-            workspace.id.clone(),
-            if workspace.destination_missing {
-                "missing".to_string()
-            } else {
-                "ok".to_string()
-            },
-        ]);
-    }
-    Ok(table.to_string())
-}
-
-fn detail_table(rt: &Runtime, workspace: &Workspace) -> Result<String> {
-    let mut lines = summary_table(rt, std::slice::from_ref(workspace))?;
-    lines.push('\n');
-    if rt.layout.global_db().exists() {
-        let conn = db::open_rw(&rt.layout.global_db())?;
-        let headers = db::headers(&conn, &workspace.id)?;
-        let mut table = ui::table(&["chat", "title", "subagent", "archived", "updated"]);
-        for header in headers {
-            table.add_row([
-                header.composer_id,
-                header.title.unwrap_or_else(|| "-".to_string()),
-                yes_no(header.is_subagent),
-                yes_no(header.is_archived),
-                header.last_updated_at.unwrap_or(0).to_string(),
-            ]);
-        }
-        lines.push_str(&table.to_string());
-    }
-    Ok(lines)
-}
-
-fn header_counts(conn: &Connection, workspace_id: &str) -> Result<(usize, usize)> {
-    let headers = db::headers(conn, workspace_id)?;
-    let subs = headers.iter().filter(|header| header.is_subagent).count();
-    Ok((headers.len().saturating_sub(subs), subs))
-}
-
-fn yes_no(value: bool) -> String {
-    if value {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    }
 }
 
 fn dir_size(path: &Path) -> Result<u64> {

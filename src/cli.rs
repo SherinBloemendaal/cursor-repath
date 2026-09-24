@@ -1,7 +1,8 @@
 //! Command surface for crepath.
 
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{ArgAction, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,15 +13,35 @@ use crate::engine::{
     export_workspace, import_archive, list_workspaces, move_paths, record_history, reindex,
     remove_targets, save_unsaved, show_history, show_stats, split_workspace, suggest_split,
 };
-use crate::ui::{self, validation};
+use crate::ui::{self, ColorMode, Theme, validation};
+
+fn styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Blue.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::Blue.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::BrightBlack.on_default())
+        .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+}
 
 #[derive(Parser)]
 #[command(
     name = "crepath",
     version,
-    about = "Repath Cursor workspaces and chats"
+    about = "Repath Cursor workspaces and chats",
+    styles = styles(),
+    disable_help_subcommand = true,
+    disable_help_flag = true
 )]
 pub struct Cli {
+    /// Show help.
+    #[arg(short = 'h', long = "help", action = ArgAction::SetTrue)]
+    pub help: bool,
+    /// Color output: auto, always, or never.
+    #[arg(long, global = true, value_enum, value_name = "WHEN", default_value_t = ColorMode::Auto)]
+    pub color: ColorMode,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -59,8 +80,13 @@ pub enum Command {
     Update,
     /// Open the GitHub repository in the browser.
     Github,
-    /// Show help.
-    Help,
+    /// Show help, or every option of one command.
+    Help(HelpArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HelpArgs {
+    pub command: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -157,15 +183,30 @@ pub struct ImportArgs {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let settings = ui::term::init(ui::term::mode_from_args(std::env::args_os()));
+    let matches = Cli::command()
+        .color(clap_color(settings.stderr))
+        .get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     dispatch(cli, None)
 }
 
+fn clap_color(enabled: bool) -> ColorChoice {
+    if enabled {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    }
+}
+
 pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
-    let Some(command) = cli.command else {
-        crate::update::notify_if_outdated();
-        ui::print_help();
-        return Ok(());
+    let command = match cli.command {
+        Some(command) if !cli.help => command,
+        _ => {
+            crate::update::notify_if_outdated();
+            ui::print_help();
+            return Ok(());
+        }
     };
     if matches!(command, Command::Update) {
         return crate::update::run_update();
@@ -174,9 +215,8 @@ pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
     if matches!(command, Command::Github) {
         return crate::update::open_github();
     }
-    if matches!(command, Command::Help) {
-        ui::print_help();
-        return Ok(());
+    if let Command::Help(args) = &command {
+        return show_help(args.command.as_deref());
     }
     let rt = match runtime {
         Some(runtime) => runtime,
@@ -204,11 +244,11 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 .or_else(|| pick_one(rt, "Reindex which workspace?"))
                 .ok_or_else(|| anyhow::anyhow!("a target is required"))?;
             let report = reindex(rt, &target)?;
-            finish(report);
+            finish(rt, "Reindex", report);
             Ok(())
         }
         Command::Ls(args) => {
-            println!(
+            print!(
                 "{}",
                 list_workspaces(rt, args.common.unsaved, args.id.as_deref())?
             );
@@ -219,11 +259,27 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 Some(target) => vec![target],
                 None => pick_many(rt, "Remove which workspaces?")?,
             };
+            if !rt.yes {
+                let rows: Vec<Vec<String>> = targets
+                    .iter()
+                    .map(|target| vec![target.clone(), removal_label(rt, target)])
+                    .collect();
+                print!(
+                    "{}",
+                    validation(
+                        Theme::stdout(),
+                        "Remove plan",
+                        &["target", "location"],
+                        &rows,
+                        &[]
+                    )
+                );
+            }
             if !ui::confirm("Remove the selected Cursor metadata?", rt.yes)? {
                 bail!("aborted");
             }
             let report = remove_targets(rt, &targets)?;
-            finish(report);
+            finish(rt, "Remove", report);
             Ok(())
         }
         Command::Export(args) => {
@@ -235,7 +291,7 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 ui::input("Archive path").unwrap_or_else(|_| "export.crepath".into())
             });
             let report = export_workspace(rt, &target, PathBuf::from(file).as_path())?;
-            finish(report);
+            finish(rt, "Export", report);
             Ok(())
         }
         Command::Import(args) => {
@@ -246,7 +302,7 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("a file is required"))?;
             let dest = args.to.map(PathBuf::from);
             let report = import_archive(rt, &file, dest.as_deref())?;
-            finish(report);
+            finish(rt, "Import", report);
             Ok(())
         }
         Command::History(_) => {
@@ -259,10 +315,34 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
         }
         Command::Update => crate::update::run_update(),
         Command::Github => crate::update::open_github(),
-        Command::Help => {
-            ui::print_help();
-            Ok(())
-        }
+        Command::Help(args) => show_help(args.command.as_deref()),
+    }
+}
+
+fn show_help(command: Option<&str>) -> Result<()> {
+    let Some(name) = command else {
+        ui::print_help();
+        return Ok(());
+    };
+    let mut root = Cli::command().color(clap_color(ui::term::settings().stdout));
+    root.build();
+    let Some(sub) = root.find_subcommand_mut(name) else {
+        return Err(ui::hinted(
+            format!("unknown command: {name}"),
+            "Run crepath help to see every command.",
+        ));
+    };
+    sub.print_help()?;
+    Ok(())
+}
+
+fn removal_label(rt: &Runtime, target: &str) -> String {
+    match engine::find_workspace(rt, target) {
+        Ok(Some(workspace)) => workspace
+            .path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| workspace.kind.label().to_string()),
+        _ => "chat".to_string(),
     }
 }
 
@@ -294,7 +374,7 @@ fn run_path(rt: &Runtime, args: PathArgs, copy: bool) -> Result<()> {
             args.project,
         )?
     };
-    finish(report);
+    finish(rt, if copy { "Copy" } else { "Move" }, report);
     Ok(())
 }
 
@@ -309,7 +389,7 @@ fn run_save(rt: &Runtime, args: SaveArgs) -> Result<()> {
         .or_else(|| ui::input("Destination folder").ok().map(PathBuf::from))
         .ok_or_else(|| anyhow::anyhow!("a destination is required"))?;
     let report = save_unsaved(rt, &id, &to)?;
-    finish(report);
+    finish(rt, "Save", report);
     Ok(())
 }
 
@@ -383,12 +463,21 @@ fn run_split(rt: &Runtime, args: SplitArgs) -> Result<()> {
             ]
         })
         .collect();
-    print!("{}", validation("Split", &rows, &[]));
+    print!(
+        "{}",
+        validation(
+            Theme::stdout(),
+            "Split plan",
+            &["chat", "targets"],
+            &rows,
+            &[]
+        )
+    );
     if !ui::confirm("Continue with this split?", rt.yes)? {
         bail!("aborted");
     }
     let report = split_workspace(rt, &source, &target_paths, &assigned, args.move_chats)?;
-    finish(report);
+    finish(rt, "Split", report);
     Ok(())
 }
 
@@ -406,7 +495,16 @@ fn run_combine(rt: &Runtime, args: CombineArgs) -> Result<()> {
         .iter()
         .map(|source| vec![source.clone(), target.clone()])
         .collect::<Vec<_>>();
-    print!("{}", validation("Combine", &rows, &[]));
+    print!(
+        "{}",
+        validation(
+            Theme::stdout(),
+            "Combine plan",
+            &["source", "target"],
+            &rows,
+            &[]
+        )
+    );
     if !ui::confirm("Continue with this combine?", rt.yes)? {
         bail!("aborted");
     }
@@ -416,7 +514,7 @@ fn run_combine(rt: &Runtime, args: CombineArgs) -> Result<()> {
         &sources,
         args.move_chats,
     )?;
-    finish(report);
+    finish(rt, "Combine", report);
     Ok(())
 }
 
@@ -451,9 +549,22 @@ fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<Vec<(String, String)>> {
         .collect::<Vec<_>>();
     print!(
         "{}",
-        validation(if copy { "Copy" } else { "Move" }, &rows, &[])
+        validation(
+            Theme::stdout(),
+            if copy { "Copy plan" } else { "Move plan" },
+            &["workspace", "destination"],
+            &rows,
+            &[]
+        )
     );
-    if !ui::confirm("Continue?", rt.yes)? {
+    if !ui::confirm(
+        if copy {
+            "Continue with this copy?"
+        } else {
+            "Continue with this move?"
+        },
+        rt.yes,
+    )? {
         bail!("aborted");
     }
     Ok(pairs)
@@ -461,18 +572,21 @@ fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<Vec<(String, String)>> {
 
 fn pick_many(rt: &Runtime, prompt: &str) -> Result<Vec<String>> {
     let workspaces = discover(rt)?;
+    let theme = Theme::stderr();
     let labels: Vec<String> = workspaces
         .iter()
         .map(|workspace| {
-            format!(
-                "{}  {}",
-                workspace.id,
-                workspace
-                    .path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| workspace.kind.label().to_string())
-            )
+            let location = workspace
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| workspace.kind.label().to_string());
+            let location = if workspace.destination_missing {
+                format!("{} {}", theme.bad(theme.icons().cross), theme.bad(location))
+            } else {
+                theme.path(location)
+            };
+            format!("{}  {location}", theme.id(&workspace.id))
         })
         .collect();
     let picked = ui::multi_select(prompt, &labels)?;
@@ -508,22 +622,76 @@ fn replace_pair(common: &CommonArgs) -> Result<Option<(String, String)>> {
     Ok(Some((common.replace[0].clone(), common.replace[1].clone())))
 }
 
-fn finish(report: engine::Report) {
+fn finish(rt: &Runtime, title: &str, report: engine::Report) {
+    print!(
+        "{}",
+        finish_text(Theme::stdout(), title, rt.dry_run, &report)
+    );
+    let theme = Theme::stderr();
     for warning in &report.warnings {
-        ui::warn(warning);
+        eprintln!("{}", ui::warn_line(theme, warning));
     }
-    for skipped in &report.skipped {
-        ui::warn(&format!("skipped {skipped}"));
-    }
-    for applied in &report.applied {
-        ui::ok(applied);
+    print!("{}", finish_summary(Theme::stdout(), rt.dry_run, &report));
+}
+
+pub fn finish_text(theme: Theme, title: &str, dry_run: bool, report: &engine::Report) -> String {
+    let heading = if dry_run {
+        format!("{title} (dry run)")
+    } else {
+        title.to_string()
+    };
+    let mut out = format!("{}\n", ui::section_line(theme, &heading));
+    if !report.applied.is_empty() || !report.skipped.is_empty() {
+        let sheet = ui::results(
+            theme,
+            &title.to_lowercase(),
+            &report.applied,
+            &report.skipped,
+        );
+        out.push_str(&format!("{sheet}\n"));
     }
     if !report.rewritten_keys.is_empty() {
-        ui::info(&format!(
-            "rewrote {} storage keys",
-            report.rewritten_keys.len()
+        out.push_str(&ui::info_line(
+            theme,
+            &format!(
+                "rewrote {} storage keys",
+                theme.number(ui::count(report.rewritten_keys.len() as u64))
+            ),
         ));
+        out.push('\n');
     }
+    out
+}
+
+pub fn finish_summary(theme: Theme, dry_run: bool, report: &engine::Report) -> String {
+    if report.applied.is_empty() && report.skipped.is_empty() {
+        return format!("{}\n", ui::info_line(theme, "Nothing to do."));
+    }
+    let applied = report.applied.len();
+    let mut parts = vec![theme.good(if dry_run {
+        ui::plural(applied, "item planned", "items planned")
+    } else {
+        ui::plural(applied, "item applied", "items applied")
+    })];
+    if !report.skipped.is_empty() {
+        parts.push(theme.caution(ui::plural(
+            report.skipped.len(),
+            "item skipped",
+            "items skipped",
+        )));
+    }
+    if !report.warnings.is_empty() {
+        parts.push(theme.caution(ui::plural(report.warnings.len(), "warning", "warnings")));
+    }
+    let mut out = format!("  {}\n", parts.join(&theme.sep()));
+    if dry_run {
+        out.push_str(&ui::hint_line(
+            theme,
+            "Nothing was changed. Run again without -n to apply.",
+        ));
+        out.push('\n');
+    }
+    out
 }
 
 fn common_of(command: &Command) -> CommonArgs {
@@ -537,7 +705,7 @@ fn common_of(command: &Command) -> CommonArgs {
         Command::Export(args) => args.common.clone(),
         Command::Import(args) => args.common.clone(),
         Command::History(args) | Command::Stats(args) => args.clone(),
-        Command::Update | Command::Github | Command::Help => CommonArgs {
+        Command::Update | Command::Github | Command::Help(_) => CommonArgs {
             dry_run: false,
             yes: true,
             profile: None,
@@ -590,7 +758,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Stats(_) => "stats",
         Command::Update => "update",
         Command::Github => "github",
-        Command::Help => "help",
+        Command::Help(_) => "help",
     }
 }
 
@@ -624,6 +792,6 @@ fn command_args(command: &Command) -> Vec<String> {
         | Command::Stats(_)
         | Command::Update
         | Command::Github
-        | Command::Help => Vec::new(),
+        | Command::Help(_) => Vec::new(),
     }
 }
