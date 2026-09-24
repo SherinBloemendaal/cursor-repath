@@ -188,6 +188,13 @@ pub const GROUPS: &[Group] = &[
                 "Download, verify, and install the latest release",
             ),
             entry(
+                ("⌫", "-"),
+                "uninstall",
+                &[],
+                "",
+                "Remove the installed binary and its PATH entry",
+            ),
+            entry(
                 ("⌂", "&"),
                 "github",
                 &[],
@@ -267,6 +274,12 @@ pub const FLAGS: &[Flag] = &[
         "--full",
         "",
         "With cache scan, rebuild the index from scratch",
+    ),
+    flag(
+        "",
+        "--purge",
+        "",
+        "With uninstall, also delete history, index, and backups",
     ),
     flag(
         "",
@@ -522,10 +535,30 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for {name}"))
     }
 
+    fn assert_logo_gap(text: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        let tag = lines
+            .iter()
+            .position(|line| line.contains("Repath Cursor workspaces and chats."))
+            .expect("tagline");
+        assert!(tag >= 2, "logo, blank line, tagline");
+        assert_eq!(
+            lines[tag - 1],
+            "",
+            "blank line between the logo and the tagline"
+        );
+        let logo = lines[tag - 2];
+        assert!(
+            logo.contains('╚') || logo.contains('|') || logo.contains('_'),
+            "logo line above the blank line: {logo:?}"
+        );
+    }
+
     #[test]
     fn every_row_shares_one_description_column() {
         for total in [80, 100, 120] {
             let plain = help_text(Theme::plain(), total);
+            assert_logo_gap(&plain);
             for theme in themes() {
                 let text = strip_ansi(&help_text(theme, total));
                 assert_eq!(text, plain, "colors changed the layout at {total}");
@@ -634,6 +667,7 @@ mod tests {
     #[test]
     fn ascii_help_keeps_the_grid() {
         let text = help_text(Theme::ascii(), 80);
+        assert_logo_gap(&text);
         assert!(text.is_ascii());
         let lines: Vec<&str> = text.lines().collect();
         let columns: Vec<usize> = GROUPS

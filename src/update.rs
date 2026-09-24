@@ -329,7 +329,7 @@ fn current_asset_name() -> Result<&'static str> {
     asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn install_binary_path() -> Result<PathBuf> {
+pub(crate) fn install_binary_path() -> Result<PathBuf> {
     let dir = match std::env::var_os("CREPATH_INSTALL") {
         Some(dir) => PathBuf::from(dir),
         None => crate::config::crepath_home()?.join("bin"),

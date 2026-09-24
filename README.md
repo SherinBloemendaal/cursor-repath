@@ -10,19 +10,13 @@
 curl -fsSL https://sherin.dev/crepath/install.sh | bash
 ```
 
-Same script from GitHub, if sherin.dev is unavailable:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.sh | bash
-```
-
 Pin a release with `bash -s`:
 
 ```bash
 curl -fsSL https://sherin.dev/crepath/install.sh | bash -s v1.0.0
 ```
 
-The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTALL`). It adds that directory to your zsh, bash, or fish config when the line is missing. Run it again to upgrade in place.
+The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTALL`). It adds that directory to your zsh, bash, or fish config when the line is missing. Run it again to upgrade in place. `crepath uninstall` removes the binary and that PATH line. `--purge` also deletes `~/.crepath`.
 
 ### Windows
 
@@ -30,7 +24,7 @@ The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTAL
 powershell -c "irm https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.ps1|iex"
 ```
 
-`$env:CREPATH_VERSION` pins a tag (`v1.0.0`). `$env:CREPATH_INSTALL` overrides the install directory (default `%USERPROFILE%\.crepath\bin`). The script adds that directory to the user PATH when it is missing.
+`$env:CREPATH_VERSION` pins a tag (`v1.0.0`). `$env:CREPATH_INSTALL` overrides the install directory (default `%USERPROFILE%\.crepath\bin`). The script adds that directory to the user PATH when it is missing. `crepath uninstall` removes that user PATH entry. `--purge` also deletes `%USERPROFILE%\.crepath`.
 
 Published archives, checked against `SHA256SUMS` on the GitHub release:
 
@@ -80,6 +74,7 @@ Any command with no arguments opens the picker (space toggles, Enter once, then 
 | `crepath cache clear\|scan\|stats`      | Clear, rescan, or inspect the persistent index behind `ls`, `stats`, and the pickers.        |
 | `crepath help [COMMAND]`                | Colored help, or every option of one command.                                                |
 | `crepath update`                        | Download and install the latest release for this OS.                                         |
+| `crepath uninstall`                     | Remove the installed binary and its PATH entry. `--purge` also deletes `~/.crepath`.         |
 | `crepath github`                        | Open the GitHub repository in the browser.                                                   |
 
 `crepath update` checks `SHA256SUMS`, then replaces the binary in `$CREPATH_INSTALL` or `~/.crepath/bin`.

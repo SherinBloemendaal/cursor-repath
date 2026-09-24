@@ -1,6 +1,6 @@
 [package]
 name = "crepath"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "CLI helper for Cursor IDE operations not exposed in the UI"
@@ -43,7 +43,7 @@ sysinfo = { version = "0.38.4", default-features = false, features = ["system"] 
 rustix = { version = "1.1.5", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"

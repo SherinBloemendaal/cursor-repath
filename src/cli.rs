@@ -86,10 +86,25 @@ pub enum Command {
     RefreshIndex,
     /// Download and install the latest release.
     Update,
+    /// Remove this install and its PATH entry.
+    Uninstall(UninstallArgs),
     /// Open the GitHub repository in the browser.
     Github,
     /// Show help, or every option of one command.
     Help(HelpArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UninstallArgs {
+    /// Show the plan and change nothing.
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+    /// Skip the confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Also delete local state: history, index, and backups.
+    #[arg(long)]
+    pub purge: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -283,6 +298,9 @@ pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
         };
         return index::background(&rt);
     }
+    if let Command::Uninstall(args) = &command {
+        return crate::uninstall::run(args);
+    }
     if matches!(command, Command::Update) {
         return crate::update::run_update();
     }
@@ -396,6 +414,7 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
         Command::Cache(args) => run_cache(rt, &args.action),
         Command::RefreshIndex => index::background(rt),
         Command::Update => crate::update::run_update(),
+        Command::Uninstall(args) => crate::uninstall::run(&args),
         Command::Github => crate::update::open_github(),
         Command::Help(args) => show_help(args.command.as_deref()),
     }
@@ -1041,6 +1060,14 @@ fn common_of(command: &Command) -> CommonArgs {
         Command::History(args) => args.clone(),
         Command::Stats(args) => args.common.clone(),
         Command::Cache(args) => args.action.common().clone(),
+        Command::Uninstall(args) => CommonArgs {
+            dry_run: args.dry_run,
+            yes: args.yes,
+            profile: None,
+            replace: Vec::new(),
+            regex: false,
+            unsaved: false,
+        },
         Command::Update | Command::Github | Command::Help(_) | Command::RefreshIndex => {
             CommonArgs {
                 dry_run: false,
@@ -1216,6 +1243,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Cache(_) => "cache",
         Command::RefreshIndex => index::REFRESH_COMMAND,
         Command::Update => "update",
+        Command::Uninstall(_) => "uninstall",
         Command::Github => "github",
         Command::Help(_) => "help",
     }
@@ -1251,6 +1279,7 @@ fn command_args(command: &Command) -> Vec<String> {
         Command::History(_)
         | Command::Stats(_)
         | Command::Update
+        | Command::Uninstall(_)
         | Command::Github
         | Command::Help(_)
         | Command::RefreshIndex => Vec::new(),
