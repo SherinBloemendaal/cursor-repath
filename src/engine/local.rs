@@ -12,7 +12,7 @@ use super::journal::Journal;
 use super::sql;
 use crate::cursor::registry::{LOCAL_COMPOSER_DATA_KEY, LOCAL_PINNED_KEY, LOCAL_SCHEMA};
 
-const TRANSCRIPTS: &str = "agent-transcripts";
+pub const TRANSCRIPTS: &str = "agent-transcripts";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Selection {

@@ -12,9 +12,9 @@ use crepath::cursor::folder_id::path_to_folder_id;
 use crepath::cursor::uri::{Platform, normalize_path};
 use crepath::cursor::workspace::{compute_renamed_hash, compute_workspace_hash, workspace_file_id};
 use crepath::engine::{
-    self, Probe, combine_workspaces, copy_paths, export_workspace, import_archive, list_workspaces,
-    move_paths, reindex, remove_targets, save_unsaved, show_history, show_stats, split_workspace,
-    suggest_split,
+    self, FixedProbe, Instance, Probe, combine_workspaces, copy_paths, export_workspace,
+    import_archive, list_workspaces, move_paths, reindex, remove_targets, save_unsaved,
+    show_history, show_stats, split_workspace, suggest_split,
 };
 use rusqlite::types::Value;
 use serde_json::json;
@@ -813,6 +813,12 @@ struct CollideAfterRename {
 }
 
 impl Probe for CollideAfterRename {
+    fn instances(&self) -> anyhow::Result<Vec<Instance>> {
+        FixedProbe(self.running()).instances()
+    }
+}
+
+impl CollideAfterRename {
     fn running(&self) -> bool {
         if !self.done.load(Ordering::SeqCst) && self.dest.exists() {
             let dir = self
@@ -907,6 +913,12 @@ struct CollideSecond {
 }
 
 impl Probe for CollideSecond {
+    fn instances(&self) -> anyhow::Result<Vec<Instance>> {
+        FixedProbe(self.running()).instances()
+    }
+}
+
+impl CollideSecond {
     fn running(&self) -> bool {
         if !self.done.load(Ordering::SeqCst) && self.first.exists() {
             fs::create_dir_all(&self.second).unwrap();

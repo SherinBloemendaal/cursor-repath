@@ -201,7 +201,12 @@ pub const GROUPS: &[Group] = &[
 pub const FLAGS: &[Flag] = &[
     flag("-n", "--dry-run", "", "Show the plan and change nothing"),
     flag("-y", "--yes", "", "Skip the confirmation prompt"),
-    flag("", "--profile", "NAME", "Limit work to one Cursor profile"),
+    flag(
+        "",
+        "--profile",
+        "NAME",
+        "Limit work to one Cursor installation, or NAME/PROFILE",
+    ),
     flag(
         "",
         "--replace",

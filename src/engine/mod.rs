@@ -22,21 +22,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::cursor::install::{self, DEFAULT};
+use crate::cursor::process::{self, NativeProcesses, ProcessSource};
 use crate::cursor::registry::{self, ComposerHeader};
 use crate::cursor::uri::{self, Platform, normalize_path, path_uri, uri_path};
 use crate::cursor::workspace::{self, compute_workspace_hash, is_workspace_file};
 use crate::ui::{self, Theme};
 
+pub use crate::cursor::process::Instance;
 pub use archive::{export_workspace, import_archive};
 pub use chats::{
     SplitSuggestion, combine_workspaces, reindex, remove_targets, split_workspace, suggest_split,
 };
 pub use db::touched_paths;
-pub use repath::{copy_paths, move_paths, save_unsaved};
+pub use repath::{copy_paths, move_paths, replaced, save_unsaved};
 pub use view::{ListRow, sort_rows};
 
+/// One Cursor installation: its user data directory plus the shared crepath and
+/// `~/.cursor/projects` directories every installation writes transcripts into.
 #[derive(Debug, Clone)]
 pub struct Layout {
+    pub name: String,
     pub cursor_root: PathBuf,
     pub projects_dir: PathBuf,
     pub crepath_home: PathBuf,
@@ -77,28 +83,49 @@ impl Layout {
 }
 
 pub trait Probe: Send + Sync {
-    fn running(&self) -> bool;
+    fn instances(&self) -> Result<Vec<Instance>>;
 }
 
-pub struct SystemProbe;
+pub struct ProcessProbe<S> {
+    source: S,
+    roots: Vec<PathBuf>,
+}
 
-impl Probe for SystemProbe {
-    fn running(&self) -> bool {
-        cursor_process_running()
+impl<S: ProcessSource> ProcessProbe<S> {
+    pub fn new(source: S, roots: Vec<PathBuf>) -> Self {
+        Self { source, roots }
     }
 }
+
+impl<S: ProcessSource> Probe for ProcessProbe<S> {
+    fn instances(&self) -> Result<Vec<Instance>> {
+        Ok(process::instances(&self.source.processes()?, &self.roots))
+    }
+}
+
+pub type SystemProbe = ProcessProbe<NativeProcesses>;
 
 pub struct FixedProbe(pub bool);
 
 impl Probe for FixedProbe {
-    fn running(&self) -> bool {
-        self.0
+    fn instances(&self) -> Result<Vec<Instance>> {
+        Ok(if self.0 {
+            vec![Instance {
+                pid: 0,
+                user_data_dir: None,
+                main: true,
+            }]
+        } else {
+            Vec::new()
+        })
     }
 }
 
 #[derive(Clone)]
 pub struct Runtime {
     pub layout: Layout,
+    pub installs: Vec<Layout>,
+    pub pinned: bool,
     pub dry_run: bool,
     pub yes: bool,
     pub profile: Option<String>,
@@ -108,13 +135,83 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn check(&self) -> Result<()> {
-        if self.probe.running() {
-            return Err(ui::hinted(
-                "Cursor is running.",
-                "Close Cursor completely and retry.",
-            ));
+        let instances = self.probe.instances().map_err(|err| {
+            ui::hinted(
+                format!("Cannot tell whether Cursor is running: {err:#}"),
+                "crepath only writes after it has confirmed that every Cursor instance is closed.",
+            )
+        })?;
+        if instances.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        Err(ui::hinted(
+            format!("Cursor is running: {}.", self.describe(&instances)),
+            "Quit every Cursor window of every profile and retry.",
+        ))
+    }
+
+    fn describe(&self, instances: &[Instance]) -> String {
+        let mut seen: Vec<(String, u32, bool)> = Vec::new();
+        for instance in instances {
+            let label = self.instance_label(instance);
+            match seen.iter_mut().find(|(name, _, _)| *name == label) {
+                Some(entry) => {
+                    if instance.main && !entry.2 {
+                        entry.1 = instance.pid;
+                        entry.2 = true;
+                    }
+                }
+                None => seen.push((label, instance.pid, instance.main)),
+            }
+        }
+        seen.sort_by(|a, b| (a.0 != DEFAULT, &a.0).cmp(&(b.0 != DEFAULT, &b.0)));
+        seen.iter()
+            .map(|(label, pid, _)| format!("{label} (pid {pid})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn instance_label(&self, instance: &Instance) -> String {
+        let Some(dir) = &instance.user_data_dir else {
+            return DEFAULT.to_string();
+        };
+        self.installs
+            .iter()
+            .chain(std::iter::once(&self.layout))
+            .find(|layout| &normalize_path(&layout.cursor_root) == dir)
+            .map(|layout| layout.name.clone())
+            .unwrap_or_else(|| ui::home_relative(&dir.display().to_string()))
+    }
+
+    pub fn scoped(&self, layout: &Layout) -> Runtime {
+        let mut rt = self.clone();
+        rt.layout = layout.clone();
+        rt
+    }
+
+    /// Installations a read command covers: the pinned one, or every one found.
+    pub fn scope(&self) -> Vec<Runtime> {
+        if self.pinned || self.installs.is_empty() {
+            return vec![self.clone()];
+        }
+        self.installs
+            .iter()
+            .map(|layout| self.scoped(layout))
+            .collect()
+    }
+
+    /// Every other installation, pinned and unfiltered.
+    pub fn siblings(&self) -> Vec<Runtime> {
+        self.installs
+            .iter()
+            .filter(|layout| layout.name != self.layout.name)
+            .map(|layout| {
+                let mut rt = self.scoped(layout);
+                rt.pinned = true;
+                rt.profile = None;
+                rt
+            })
+            .collect()
     }
 }
 
@@ -146,6 +243,7 @@ pub struct Workspace {
     pub kind: Kind,
     pub uri: Option<String>,
     pub path: Option<PathBuf>,
+    pub install: String,
     pub profile: String,
     pub destination_missing: bool,
 }
@@ -200,9 +298,19 @@ impl Workspace {
             kind,
             uri: Some(path_uri(&path)),
             path: Some(path),
-            profile: "default".to_string(),
+            install: layout.name.clone(),
+            profile: DEFAULT.to_string(),
             destination_missing: false,
         })
+    }
+
+    /// Installation name, plus the VS Code profile when it is not the default one.
+    pub fn profile_label(&self) -> String {
+        if self.profile == DEFAULT {
+            self.install.clone()
+        } else {
+            format!("{}/{}", self.install, self.profile)
+        }
     }
 
     /// Directory name under `~/.cursor/projects`.
@@ -255,40 +363,95 @@ pub fn render_workspaces(
     theme: Theme,
 ) -> Result<String> {
     let _spinner = ui::spinner("Scanning workspaces", rt.quiet);
-    let mut workspaces = filtered_workspaces(rt, unsaved_only)?;
-    let conn = open_global_ro(rt)?;
     if let Some(id) = detail {
         let wanted = normalize_path(Path::new(id));
-        let index = workspaces
-            .iter()
-            .position(|workspace| {
+        let mut out = Vec::new();
+        for scoped in rt.scope() {
+            let mut workspaces = filtered_workspaces(&scoped, unsaved_only)?;
+            let Some(index) = workspaces.iter().position(|workspace| {
                 workspace.id == id || workspace.path.as_ref().is_some_and(|path| path == &wanted)
-            })
-            .with_context(|| format!("no workspace matches {id}"))?;
-        let workspace = workspaces.swap_remove(index);
-        let headers = match &conn {
-            Some(conn) => db::headers(conn, &workspace.id)?,
-            None => Vec::new(),
-        };
-        let row = list_row(conn.as_ref(), workspace)?;
-        return Ok(view::render_detail(theme, &row, &headers));
+            }) else {
+                continue;
+            };
+            let workspace = workspaces.swap_remove(index);
+            let conn = open_global_ro(&scoped)?;
+            let headers = match &conn {
+                Some(conn) => db::headers(conn, &workspace.id)?,
+                None => Vec::new(),
+            };
+            let row = list_row(conn.as_ref(), workspace)?;
+            out.push(view::render_detail(theme, &row, &headers));
+        }
+        if out.is_empty() {
+            anyhow::bail!("no workspace matches {id}");
+        }
+        return Ok(out.join("\n"));
     }
-    let mut rows = workspaces
-        .into_iter()
-        .map(|workspace| list_row(conn.as_ref(), workspace))
-        .collect::<Result<Vec<_>>>()?;
-    sort_rows(&mut rows);
-    Ok(view::render_list(theme, &rows))
+    Ok(view::render_list(theme, &list_rows(rt, unsaved_only)?))
 }
 
 pub fn list_rows(rt: &Runtime, unsaved_only: bool) -> Result<Vec<ListRow>> {
-    let conn = open_global_ro(rt)?;
-    let mut rows = filtered_workspaces(rt, unsaved_only)?
-        .into_iter()
-        .map(|workspace| list_row(conn.as_ref(), workspace))
-        .collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for scoped in rt.scope() {
+        let conn = open_global_ro(&scoped)?;
+        for workspace in filtered_workspaces(&scoped, unsaved_only)? {
+            rows.push(list_row(conn.as_ref(), workspace)?);
+        }
+    }
     sort_rows(&mut rows);
     Ok(rows)
+}
+
+/// Installations in scope that hold `spec` as a workspace id, path, unsaved id, or chat id.
+pub fn locate(rt: &Runtime, spec: &str) -> Result<Vec<Layout>> {
+    let mut found = Vec::new();
+    for scoped in rt.scope() {
+        let hit = find_workspace(&scoped, spec)?.is_some()
+            || match open_global_ro(&scoped)? {
+                Some(conn) => {
+                    registry::load_header(&conn, spec)?.is_some()
+                        || db::read_value(
+                            &conn,
+                            journal::Table::Disk,
+                            &format!("composerData:{spec}"),
+                        )?
+                        .is_some()
+                }
+                None => false,
+            };
+        if hit {
+            found.push(scoped.layout);
+        }
+    }
+    Ok(found)
+}
+
+/// Other installations with a workspace that writes into `~/.cursor/projects/<slug>`.
+pub fn slug_users(rt: &Runtime, slug: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for sibling in rt.siblings() {
+        if discover(&sibling)?
+            .iter()
+            .any(|workspace| workspace.slug().as_deref() == Some(slug))
+        {
+            names.push(sibling.layout.name);
+        }
+    }
+    Ok(names)
+}
+
+/// Other installations with a workspace on `path`.
+pub fn path_users(rt: &Runtime, path: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for sibling in rt.siblings() {
+        if discover(&sibling)?
+            .iter()
+            .any(|workspace| workspace.path.as_deref() == Some(path))
+        {
+            names.push(sibling.layout.name);
+        }
+    }
+    Ok(names)
 }
 
 fn filtered_workspaces(rt: &Runtime, unsaved_only: bool) -> Result<Vec<Workspace>> {
@@ -379,7 +542,7 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
             let profile = uri
                 .as_ref()
                 .and_then(|value| profiles.get(value).cloned())
-                .unwrap_or_else(|| "default".to_string());
+                .unwrap_or_else(|| DEFAULT.to_string());
             let destination_missing = match kind {
                 Kind::Folder | Kind::CodeWorkspace => {
                     path.as_ref().is_none_or(|path| !path.exists())
@@ -392,6 +555,7 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
                 kind,
                 uri,
                 path,
+                install: rt.layout.name.clone(),
                 profile,
                 destination_missing,
             });
@@ -401,26 +565,24 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
     Ok(found)
 }
 
+/// VS Code user data profiles of the runtime's installation.
+pub fn user_profiles(rt: &Runtime) -> Result<Vec<install::UserProfile>> {
+    Ok(install::user_profiles(&install::read_storage(
+        &rt.layout.storage_json(),
+    )?))
+}
+
 fn profile_map(rt: &Runtime) -> Result<HashMap<String, String>> {
-    let path = rt.layout.storage_json();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let raw = fs::read_to_string(path)?;
-    let json: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let json = install::read_storage(&rt.layout.storage_json())?;
+    let profiles = install::user_profiles(&json);
     let mut map = HashMap::new();
     if let Some(workspaces) = json
         .pointer("/profileAssociations/workspaces")
         .and_then(|v| v.as_object())
     {
-        for (uri, name) in workspaces {
-            let label = name.as_str().unwrap_or("default");
-            let label = if label == "__default__profile__" {
-                "default"
-            } else {
-                label
-            };
-            map.insert(uri.clone(), label.to_string());
+        for (uri, id) in workspaces {
+            let id = id.as_str().unwrap_or(install::DEFAULT_PROFILE);
+            map.insert(uri.clone(), install::profile_name(&profiles, id));
         }
     }
     Ok(map)
@@ -553,45 +715,6 @@ fn longest_target(path: &Path, targets: &[PathBuf]) -> Option<PathBuf> {
         .filter(|target| path.starts_with(target))
         .max_by_key(|target| target.as_os_str().len())
         .cloned()
-}
-
-fn cursor_process_running() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("pgrep")
-            .args(["-x", "Cursor"])
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("pgrep")
-            .args(["-x", "cursor"])
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Cursor.exe"])
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).contains("Cursor.exe"))
-            .unwrap_or(false)
-    }
-}
-
-pub fn profiles_from_storage(json: &Value) -> Vec<String> {
-    let mut names = vec!["default".to_string()];
-    if let Some(items) = json.get("userDataProfiles").and_then(|v| v.as_array()) {
-        for item in items {
-            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                names.push(name.to_string());
-            }
-        }
-    }
-    names
 }
 
 pub fn load_registry(conn: &Connection) -> Result<Vec<ComposerHeader>> {

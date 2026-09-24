@@ -84,12 +84,25 @@ pub fn export_workspace(rt: &Runtime, target: &str, file: &Path) -> Result<Repor
     let storage_prefix = format!("workspaceStorage/{}", workspace.id);
     files.extend(tree_entries(&workspace.dir, &storage_prefix)?);
     let slug = workspace.slug();
-    let project_dir = slug.as_ref().map(|slug| rt.layout.projects_dir.join(slug));
     let project_prefix = slug.as_ref().map(|slug| format!("projects/{slug}"));
-    if let (Some(dir), Some(prefix)) = (&project_dir, &project_prefix)
-        && dir.is_dir()
-    {
-        files.extend(tree_entries(dir, prefix)?);
+    let project = match &slug {
+        Some(slug) => {
+            let dir = rt.layout.projects_dir.join(slug);
+            let keep: Option<HashSet<String>> = if super::slug_users(rt, slug)?.is_empty() {
+                None
+            } else {
+                Some(ids.iter().cloned().collect())
+            };
+            project_tree(&dir, keep.as_ref())?
+        }
+        None => Vec::new(),
+    };
+    if let Some(prefix) = &project_prefix {
+        for (path, rel, is_dir) in &project {
+            if !is_dir {
+                files.push(file_entry(&format!("{prefix}/{rel}"), path)?);
+            }
+        }
     }
     let manifest = json!({
         "version": VERSION,
@@ -125,10 +138,19 @@ pub fn export_workspace(rt: &Runtime, target: &str, file: &Path) -> Result<Repor
         if workspace.dir.is_dir() {
             builder.append_dir_all(&storage_prefix, &workspace.dir)?;
         }
-        if let (Some(dir), Some(prefix)) = (&project_dir, &project_prefix)
-            && dir.is_dir()
-        {
-            builder.append_dir_all(prefix, dir)?;
+        if let Some(prefix) = &project_prefix {
+            for (path, rel, is_dir) in &project {
+                let name = if rel.is_empty() {
+                    prefix.clone()
+                } else {
+                    format!("{prefix}/{rel}")
+                };
+                if *is_dir {
+                    builder.append_dir(&name, path)?;
+                } else {
+                    builder.append_path_with_name(path, &name)?;
+                }
+            }
         }
         builder.append_path_with_name(&manifest_path, "manifest.json")?;
         builder.into_inner()?.finish()?.flush()?;
@@ -224,6 +246,56 @@ fn tree_entries(root: &Path, prefix: &str) -> Result<Vec<Json>> {
             &format!("{prefix}/{}", rel.join("/")),
             entry.path(),
         )?);
+    }
+    Ok(out)
+}
+
+/// Entries under a project slug as `(path, relative name, is_dir)`. With `keep`, the slug is
+/// shared with another installation and only the transcripts of those chats are included.
+fn project_tree(
+    root: &Path,
+    keep: Option<&HashSet<String>>,
+) -> Result<Vec<(PathBuf, String, bool)>> {
+    let mut out = Vec::new();
+    if !root.is_dir() {
+        return Ok(out);
+    }
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            let Some(keep) = keep else {
+                return true;
+            };
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                return true;
+            };
+            let mut parts = rel.components();
+            match (parts.next(), parts.next()) {
+                (Some(first), Some(second)) if first.as_os_str() == local::TRANSCRIPTS => {
+                    let name = second.as_os_str().to_string_lossy();
+                    let id = name.split('.').next().unwrap_or_default();
+                    keep.contains(id)
+                }
+                _ => true,
+            }
+        });
+    for entry in walker {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!("refusing to export symlink {}", entry.path().display());
+        }
+        let rel: Vec<String> = entry
+            .path()
+            .strip_prefix(root)?
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let is_dir = entry.file_type().is_dir();
+        if is_dir || entry.file_type().is_file() {
+            out.push((entry.path().to_path_buf(), rel.join("/"), is_dir));
+        }
     }
     Ok(out)
 }
@@ -914,7 +986,8 @@ pub fn import_archive(
                 kind: source.kind.clone(),
                 uri: source.uri.clone(),
                 path: source.path.clone(),
-                profile: "default".to_string(),
+                install: rt.layout.name.clone(),
+                profile: crate::cursor::install::DEFAULT.to_string(),
                 destination_missing: false,
             })
         }

@@ -3,15 +3,20 @@
 use anyhow::{Result, bail};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{ArgAction, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config;
+use crate::cursor::install::{self, DEFAULT};
+use crate::cursor::process::NativeProcesses;
 use crate::engine::{
-    self, FixedProbe, Layout, Runtime, SystemProbe, combine_workspaces, copy_paths, discover,
-    export_workspace, import_archive, list_workspaces, move_paths, record_history, reindex,
-    remove_targets, save_unsaved, show_history, show_stats, split_workspace, suggest_split,
+    self, FixedProbe, Layout, Runtime, SystemProbe, Workspace, combine_workspaces, copy_paths,
+    discover, export_workspace, import_archive, list_workspaces, move_paths, record_history,
+    reindex, remove_targets, save_unsaved, show_history, show_stats, split_workspace,
+    suggest_split,
 };
 use crate::ui::{self, ColorMode, Theme, validation};
 
@@ -97,7 +102,7 @@ pub struct CommonArgs {
     /// Skip the single warning prompt.
     #[arg(short = 'y', long)]
     pub yes: bool,
-    /// Limit work to one Cursor profile.
+    /// Limit work to one Cursor installation, or NAME/PROFILE for one VS Code profile in it.
     #[arg(long)]
     pub profile: Option<String>,
     /// Rewrite every matching path from FROM to TO.
@@ -224,9 +229,10 @@ pub fn dispatch(cli: Cli, runtime: Option<Runtime>) -> Result<()> {
     if let Command::Help(args) = &command {
         return show_help(args.command.as_deref());
     }
+    let common = common_of(&command);
     let rt = match runtime {
-        Some(runtime) => runtime,
-        None => production_runtime(&common_of(&command))?,
+        Some(runtime) => configure(runtime, &common)?,
+        None => production_runtime(&common)?,
     };
     let started = Instant::now();
     let name = command_name(&command);
@@ -245,12 +251,9 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
         Command::Split(args) => run_split(rt, args),
         Command::Combine(args) => run_combine(rt, args),
         Command::Rx(args) => {
-            let target = args
-                .target
-                .or_else(|| pick_one(rt, "Reindex which workspace?"))
-                .ok_or_else(|| anyhow::anyhow!("a target is required"))?;
-            let report = reindex(rt, &target)?;
-            finish(rt, "Reindex", report);
+            let (rt, target) = one_target(rt, args.target, "Reindex which workspace?")?;
+            let report = reindex(&rt, &target)?;
+            finish(&rt, "Reindex", report);
             Ok(())
         }
         Command::Ls(args) => {
@@ -261,10 +264,11 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Rm(args) => {
-            let targets = match args.target {
-                Some(target) => vec![target],
+            let (rt, targets) = match args.target {
+                Some(target) => (resolve_install(rt, &[target.as_str()])?, vec![target]),
                 None => pick_many(rt, "Remove which workspaces?")?,
             };
+            let rt = &rt;
             if !rt.dry_run && !rt.yes {
                 let rows: Vec<Vec<String>> = targets
                     .iter()
@@ -289,15 +293,12 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
             Ok(())
         }
         Command::Export(args) => {
-            let target = args
-                .target
-                .or_else(|| pick_one(rt, "Export which workspace?"))
-                .ok_or_else(|| anyhow::anyhow!("a target is required"))?;
+            let (rt, target) = one_target(rt, args.target, "Export which workspace?")?;
             let file = args.file.unwrap_or_else(|| {
                 ui::input("Archive path").unwrap_or_else(|_| "export.crepath".into())
             });
-            let report = export_workspace(rt, &target, PathBuf::from(file).as_path())?;
-            finish(rt, "Export", report);
+            let report = export_workspace(&rt, &target, PathBuf::from(file).as_path())?;
+            finish(&rt, "Export", report);
             Ok(())
         }
         Command::Import(args) => {
@@ -306,9 +307,10 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 .map(PathBuf::from)
                 .or_else(|| ui::input("Archive path").ok().map(PathBuf::from))
                 .ok_or_else(|| anyhow::anyhow!("a file is required"))?;
+            let rt = import_install(rt, args.to.as_deref())?;
             let dest = args.to.map(PathBuf::from);
-            let report = import_archive(rt, &file, dest.as_deref(), args.overwrite)?;
-            finish(rt, "Import", report);
+            let report = import_archive(&rt, &file, dest.as_deref(), args.overwrite)?;
+            finish(&rt, "Import", report);
             Ok(())
         }
         Command::History(_) => {
@@ -354,11 +356,18 @@ fn removal_label(rt: &Runtime, target: &str) -> String {
 
 fn run_path(rt: &Runtime, args: PathArgs, copy: bool) -> Result<()> {
     let replace = replace_pair(&args.common)?;
-    let pairs = match (&args.from, &args.to, replace.is_some()) {
-        (Some(from), Some(to), false) => vec![(from.clone(), to.clone())],
-        (_, _, true) => Vec::new(),
+    let (rt, pairs) = match (&args.from, &args.to, &replace) {
+        (Some(from), Some(to), None) => (
+            resolve_install(rt, &[from.as_str()])?,
+            vec![(from.clone(), to.clone())],
+        ),
+        (_, _, Some((from, to))) => (
+            replace_install(rt, from, to, args.common.regex)?,
+            Vec::new(),
+        ),
         _ => pick_path_pairs(rt, copy)?,
     };
+    let rt = &rt;
     let report = if copy {
         copy_paths(
             rt,
@@ -385,25 +394,23 @@ fn run_path(rt: &Runtime, args: PathArgs, copy: bool) -> Result<()> {
 }
 
 fn run_save(rt: &Runtime, args: SaveArgs) -> Result<()> {
-    let id = args
-        .id
-        .or_else(|| pick_unsaved(rt))
-        .ok_or_else(|| anyhow::anyhow!("an unsaved workspace id is required"))?;
+    let (rt, id) = match args.id {
+        Some(id) => (resolve_install(rt, &[id.as_str()])?, id),
+        None => pick_unsaved(rt)?,
+    };
     let to = args
         .to
         .map(PathBuf::from)
         .or_else(|| ui::input("Destination folder").ok().map(PathBuf::from))
         .ok_or_else(|| anyhow::anyhow!("a destination is required"))?;
-    let report = save_unsaved(rt, &id, &to)?;
-    finish(rt, "Save", report);
+    let report = save_unsaved(&rt, &id, &to)?;
+    finish(&rt, "Save", report);
     Ok(())
 }
 
 fn run_split(rt: &Runtime, args: SplitArgs) -> Result<()> {
-    let source = args
-        .source
-        .or_else(|| pick_one(rt, "Split which workspace?"))
-        .ok_or_else(|| anyhow::anyhow!("a source workspace is required"))?;
+    let (rt, source) = one_target(rt, args.source, "Split which workspace?")?;
+    let rt = &rt;
     let targets = if args.targets.is_empty() {
         ui::input("Target folders, separated by commas")?
             .split(',')
@@ -492,11 +499,13 @@ fn run_combine(rt: &Runtime, args: CombineArgs) -> Result<()> {
         .target
         .or_else(|| ui::input("Target folder or workspace").ok())
         .ok_or_else(|| anyhow::anyhow!("a target is required"))?;
-    let sources = if args.sources.is_empty() {
+    let (rt, sources) = if args.sources.is_empty() {
         pick_many(rt, "Combine which sources?")?
     } else {
-        args.sources
+        let specs: Vec<&str> = args.sources.iter().map(String::as_str).collect();
+        (resolve_install(rt, &specs)?, args.sources)
     };
+    let rt = &rt;
     let rows = sources
         .iter()
         .map(|source| vec![source.clone(), target.clone()])
@@ -524,8 +533,8 @@ fn run_combine(rt: &Runtime, args: CombineArgs) -> Result<()> {
     Ok(())
 }
 
-fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<Vec<(String, String)>> {
-    let ids = pick_many(
+fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<(Runtime, Vec<(String, String)>)> {
+    let (rt, ids) = pick_many(
         rt,
         if copy {
             "Copy which workspaces?"
@@ -533,6 +542,7 @@ fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<Vec<(String, String)>> {
             "Move which workspaces?"
         },
     )?;
+    let rt = &rt;
     let mut pairs = Vec::new();
     if ids.len() == 1 {
         let dest = ui::input("Destination path")?;
@@ -573,15 +583,189 @@ fn pick_path_pairs(rt: &Runtime, copy: bool) -> Result<Vec<(String, String)>> {
     )? {
         bail!("aborted");
     }
-    Ok(pairs)
+    Ok((rt.clone(), pairs))
 }
 
-fn pick_many(rt: &Runtime, prompt: &str) -> Result<Vec<String>> {
-    let workspaces = discover(rt)?;
-    let theme = Theme::stderr();
-    let labels: Vec<String> = workspaces
+fn pin(rt: &Runtime) -> Runtime {
+    let mut rt = rt.clone();
+    rt.pinned = true;
+    rt
+}
+
+fn mixed(first: (&str, &str), second: (&str, &str)) -> anyhow::Error {
+    ui::hinted(
+        format!(
+            "{} is in profile {}, but {} is in profile {}",
+            first.0, first.1, second.0, second.1
+        ),
+        "crepath never mixes Cursor installations. Run the command once per profile with --profile NAME.",
+    )
+}
+
+fn ask_install(rt: &Runtime, names: &[String], why: &str) -> Result<Runtime> {
+    let name = if names.is_empty() {
+        bail!("{why}: no Cursor installation was found");
+    } else if names.len() == 1 {
+        names[0].clone()
+    } else if rt.quiet || !std::io::stdin().is_terminal() {
+        return Err(ui::hinted(
+            why.to_string(),
+            format!("Pass --profile with one of: {}.", names.join(", ")),
+        ));
+    } else {
+        let items: Vec<&str> = names.iter().map(String::as_str).collect();
+        names[ui::select(&format!("{why}. Which Cursor profile?"), &items)?].clone()
+    };
+    let layout = rt
+        .installs
         .iter()
-        .map(|workspace| {
+        .find(|layout| layout.name == name)
+        .ok_or_else(|| anyhow::anyhow!("unknown Cursor profile {name}"))?;
+    Ok(pin(&rt.scoped(layout)))
+}
+
+/// The one installation that holds every spec, asking when several do.
+fn resolve_install(rt: &Runtime, specs: &[&str]) -> Result<Runtime> {
+    if rt.installs.len() <= 1 {
+        return Ok(rt.clone());
+    }
+    if rt.pinned {
+        for spec in specs {
+            if !engine::locate(rt, spec)?.is_empty() {
+                continue;
+            }
+            let mut owners = Vec::new();
+            for sibling in rt.siblings() {
+                if !engine::locate(&sibling, spec)?.is_empty() {
+                    owners.push(sibling.layout.name);
+                }
+            }
+            if !owners.is_empty() {
+                return Err(ui::hinted(
+                    format!(
+                        "{spec} belongs to profile {}, not {}",
+                        owners.join(", "),
+                        rt.layout.name
+                    ),
+                    "crepath never moves data between Cursor installations. Pass the profile that holds it.",
+                ));
+            }
+        }
+        return Ok(rt.clone());
+    }
+    let mut shared: Option<BTreeSet<String>> = None;
+    let mut seen: Vec<(&str, BTreeSet<String>)> = Vec::new();
+    for spec in specs {
+        let names: BTreeSet<String> = engine::locate(rt, spec)?
+            .into_iter()
+            .map(|layout| layout.name)
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        let next: BTreeSet<String> = match &shared {
+            Some(prev) => prev.intersection(&names).cloned().collect(),
+            None => names.clone(),
+        };
+        if next.is_empty()
+            && let Some((first, owners)) = seen.first()
+        {
+            let join = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
+            return Err(mixed((first, &join(owners)), (spec, &join(&names))));
+        }
+        seen.push((spec, names));
+        shared = Some(next);
+    }
+    let Some(shared) = shared else {
+        return Ok(rt.clone());
+    };
+    let names: Vec<String> = shared.into_iter().collect();
+    ask_install(
+        rt,
+        &names,
+        &format!(
+            "{} exists in profiles {}",
+            specs.join(", "),
+            names.join(", ")
+        ),
+    )
+}
+
+fn replace_install(rt: &Runtime, from: &str, to: &str, regex: bool) -> Result<Runtime> {
+    if rt.pinned || rt.installs.len() <= 1 {
+        return Ok(rt.clone());
+    }
+    let mut names = Vec::new();
+    for scoped in rt.scope() {
+        if !engine::replaced(&scoped, from, to, regex)?.is_empty() {
+            names.push(scoped.layout.name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(rt.clone());
+    }
+    ask_install(
+        rt,
+        &names,
+        &format!(
+            "--replace {from} matches workspaces in profiles {}",
+            names.join(", ")
+        ),
+    )
+}
+
+fn import_install(rt: &Runtime, to: Option<&str>) -> Result<Runtime> {
+    if rt.pinned || rt.installs.len() <= 1 {
+        return Ok(rt.clone());
+    }
+    if let Some(to) = to {
+        let names: Vec<String> = engine::locate(rt, to)?
+            .into_iter()
+            .map(|layout| layout.name)
+            .collect();
+        if !names.is_empty() {
+            return ask_install(
+                rt,
+                &names,
+                &format!("{to} exists in profiles {}", names.join(", ")),
+            );
+        }
+    }
+    let names: Vec<String> = rt
+        .installs
+        .iter()
+        .map(|layout| layout.name.clone())
+        .collect();
+    ask_install(
+        rt,
+        &names,
+        "import needs one Cursor installation to write into",
+    )
+}
+
+fn pick_from(
+    rt: &Runtime,
+    prompt: &str,
+    keep: impl Fn(&Workspace) -> bool,
+) -> Result<(Runtime, Vec<String>)> {
+    let scopes = rt.scope();
+    let labelled = scopes.len() > 1;
+    let mut found: Vec<(Runtime, Workspace)> = Vec::new();
+    for scoped in scopes {
+        for workspace in discover(&scoped)? {
+            let wanted = scoped
+                .profile
+                .as_ref()
+                .is_none_or(|profile| &workspace.profile == profile);
+            if wanted && keep(&workspace) {
+                found.push((scoped.clone(), workspace));
+            }
+        }
+    }
+    let theme = Theme::stderr();
+    let labels: Vec<String> = found
+        .iter()
+        .map(|(_, workspace)| {
             let location = workspace
                 .path
                 .as_ref()
@@ -592,30 +776,63 @@ fn pick_many(rt: &Runtime, prompt: &str) -> Result<Vec<String>> {
             } else {
                 theme.path(location)
             };
-            format!("{}  {location}", theme.id(&workspace.id))
+            if labelled {
+                format!(
+                    "{}  {}  {location}",
+                    theme.id(&workspace.id),
+                    theme.bold(workspace.profile_label())
+                )
+            } else {
+                format!("{}  {location}", theme.id(&workspace.id))
+            }
         })
         .collect();
     let picked = ui::multi_select(prompt, &labels)?;
-    Ok(picked
+    let mut chosen: Option<(Runtime, String)> = None;
+    let mut ids = Vec::new();
+    for index in picked {
+        let (scoped, workspace) = &found[index];
+        match &chosen {
+            Some((existing, first)) if existing.layout.name != scoped.layout.name => {
+                return Err(mixed(
+                    (first, &existing.layout.name),
+                    (&workspace.id, &scoped.layout.name),
+                ));
+            }
+            Some(_) => {}
+            None => chosen = Some((pin(scoped), workspace.id.clone())),
+        }
+        ids.push(workspace.id.clone());
+    }
+    Ok((chosen.map_or_else(|| rt.clone(), |(scoped, _)| scoped), ids))
+}
+
+fn pick_many(rt: &Runtime, prompt: &str) -> Result<(Runtime, Vec<String>)> {
+    pick_from(rt, prompt, |_| true)
+}
+
+fn one_target(rt: &Runtime, target: Option<String>, prompt: &str) -> Result<(Runtime, String)> {
+    match target {
+        Some(target) => Ok((resolve_install(rt, &[target.as_str()])?, target)),
+        None => {
+            let (rt, mut ids) = pick_many(rt, prompt)?;
+            let target = ids
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("a target is required"))?;
+            Ok((rt, target))
+        }
+    }
+}
+
+fn pick_unsaved(rt: &Runtime) -> Result<(Runtime, String)> {
+    let (rt, ids) = pick_from(rt, "Unsaved workspace", |workspace| {
+        workspace.kind == engine::Kind::Unsaved
+    })?;
+    let id = ids
         .into_iter()
-        .map(|index| workspaces[index].id.clone())
-        .collect())
-}
-
-fn pick_one(rt: &Runtime, prompt: &str) -> Option<String> {
-    pick_many(rt, prompt).ok().and_then(|mut ids| ids.pop())
-}
-
-fn pick_unsaved(rt: &Runtime) -> Option<String> {
-    discover(rt).ok().and_then(|workspaces| {
-        let labels: Vec<String> = workspaces
-            .iter()
-            .filter(|workspace| workspace.kind == engine::Kind::Unsaved)
-            .map(|workspace| workspace.id.clone())
-            .collect();
-        let picked = ui::multi_select("Unsaved workspace", &labels).ok()?;
-        picked.first().map(|index| labels[*index].clone())
-    })
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("an unsaved workspace id is required"))?;
+    Ok((rt, id))
 }
 
 fn replace_pair(common: &CommonArgs) -> Result<Option<(String, String)>> {
@@ -723,23 +940,135 @@ fn common_of(command: &Command) -> CommonArgs {
 }
 
 pub fn production_runtime(common: &CommonArgs) -> Result<Runtime> {
-    Ok(Runtime {
-        layout: Layout {
-            cursor_root: config::cursor_config_dir()?,
-            projects_dir: config::cursor_projects_dir()?,
-            crepath_home: config::crepath_home()?,
+    let projects_dir = config::cursor_projects_dir()?;
+    let crepath_home = config::crepath_home()?;
+    let installs: Vec<Layout> = install::discover(&install::Roots::system()?)
+        .into_iter()
+        .map(|found| Layout {
+            name: found.name,
+            cursor_root: found.root,
+            projects_dir: projects_dir.clone(),
+            crepath_home: crepath_home.clone(),
+        })
+        .collect();
+    let layout = installs
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no Cursor installation was found"))?;
+    let roots = installs
+        .iter()
+        .map(|layout| layout.cursor_root.clone())
+        .collect();
+    configure(
+        Runtime {
+            layout,
+            installs,
+            pinned: false,
+            dry_run: false,
+            yes: false,
+            profile: None,
+            probe: Arc::new(SystemProbe::new(NativeProcesses, roots)),
+            quiet: false,
         },
-        dry_run: common.dry_run,
-        yes: common.yes,
-        profile: common.profile.clone(),
-        probe: Arc::new(SystemProbe),
-        quiet: false,
-    })
+        common,
+    )
+}
+
+/// Apply the shared flags to a runtime; `--profile` pins one installation.
+pub fn configure(mut rt: Runtime, common: &CommonArgs) -> Result<Runtime> {
+    rt.dry_run |= common.dry_run;
+    rt.yes |= common.yes;
+    match &common.profile {
+        Some(selector) => select_profile(rt, selector),
+        None => Ok(rt),
+    }
+}
+
+fn profile_labels(rt: &Runtime) -> Result<Vec<String>> {
+    let mut labels = Vec::new();
+    for layout in &rt.installs {
+        labels.push(layout.name.clone());
+        for profile in engine::user_profiles(&rt.scoped(layout))? {
+            labels.push(format!("{}/{}", layout.name, profile.name));
+        }
+    }
+    Ok(labels)
+}
+
+fn unknown_profile(rt: &Runtime, selector: &str) -> Result<anyhow::Error> {
+    Ok(ui::hinted(
+        format!("no Cursor profile named {selector}"),
+        format!("Known profiles: {}.", profile_labels(rt)?.join(", ")),
+    ))
+}
+
+/// `NAME` picks an installation, `NAME/PROFILE` a VS Code profile inside it, and a bare
+/// VS Code profile name works when exactly one installation has it.
+pub fn select_profile(mut rt: Runtime, selector: &str) -> Result<Runtime> {
+    let (install_name, profile) = match selector.split_once('/') {
+        Some((install_name, profile)) => (install_name, Some(profile)),
+        None => (selector, None),
+    };
+    if let Some(layout) = rt
+        .installs
+        .iter()
+        .find(|layout| layout.name.eq_ignore_ascii_case(install_name))
+        .cloned()
+    {
+        let profile = match profile {
+            None => None,
+            Some(wanted) if wanted.eq_ignore_ascii_case(DEFAULT) => Some(DEFAULT.to_string()),
+            Some(wanted) => {
+                let found = engine::user_profiles(&rt.scoped(&layout))?
+                    .into_iter()
+                    .find(|found| found.name.eq_ignore_ascii_case(wanted) || found.id == wanted);
+                match found {
+                    Some(found) => Some(found.name),
+                    None => return Err(unknown_profile(&rt, selector)?),
+                }
+            }
+        };
+        rt.layout = layout;
+        rt.pinned = true;
+        rt.profile = profile;
+        return Ok(rt);
+    }
+    if profile.is_none() {
+        let mut hits = Vec::new();
+        for layout in &rt.installs {
+            for found in engine::user_profiles(&rt.scoped(layout))? {
+                if found.name.eq_ignore_ascii_case(selector) || found.id == selector {
+                    hits.push((layout.clone(), found.name));
+                }
+            }
+        }
+        if hits.len() > 1 {
+            return Err(ui::hinted(
+                format!(
+                    "VS Code profile {selector} exists in {}",
+                    hits.iter()
+                        .map(|(layout, _)| layout.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!("Pass --profile INSTALLATION/{selector}."),
+            ));
+        }
+        if let Some((layout, name)) = hits.pop() {
+            rt.layout = layout;
+            rt.pinned = true;
+            rt.profile = Some(name);
+            return Ok(rt);
+        }
+    }
+    Err(unknown_profile(&rt, selector)?)
 }
 
 pub fn test_runtime(layout: Layout, running: bool, dry_run: bool) -> Runtime {
     Runtime {
+        installs: vec![layout.clone()],
         layout,
+        pinned: false,
         dry_run,
         yes: true,
         profile: None,

@@ -11,8 +11,8 @@ use crepath::cursor::rewrite::Replacement;
 use crepath::cursor::storage::rewrite_storage_json;
 use crepath::cursor::workspace::compute_workspace_hash;
 use crepath::engine::{
-    self, Layout, Probe, combine_workspaces, load_registry, move_paths, save_unsaved,
-    split_workspace, suggest_split,
+    self, FixedProbe, Instance, Layout, Probe, combine_workspaces, load_registry, move_paths,
+    save_unsaved, split_workspace, suggest_split,
 };
 use rusqlite::params;
 use rusqlite::types::Value;
@@ -728,6 +728,12 @@ struct AbortAfterCommit {
 }
 
 impl Probe for AbortAfterCommit {
+    fn instances(&self) -> anyhow::Result<Vec<Instance>> {
+        FixedProbe(self.running()).instances()
+    }
+}
+
+impl AbortAfterCommit {
     fn running(&self) -> bool {
         if self.tripped.load(Ordering::SeqCst) {
             return true;

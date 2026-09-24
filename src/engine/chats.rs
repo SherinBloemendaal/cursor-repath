@@ -138,7 +138,8 @@ fn owner(rt: &Runtime, id: &str) -> Result<Workspace> {
         kind: Kind::EmptyWindow,
         uri: None,
         path: None,
-        profile: "default".to_string(),
+        install: rt.layout.name.clone(),
+        profile: crate::cursor::install::DEFAULT.to_string(),
         destination_missing: false,
     })
 }

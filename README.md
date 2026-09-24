@@ -51,7 +51,7 @@ Cursor stores chats against a workspace path. Rename or move that folder and the
 
 It is not affiliated with Anysphere. It only reads files already on your machine. See [DISCLAIMER.md](DISCLAIMER.md).
 
-Close Cursor before any command that writes. `crepath` aborts if Cursor is running, and again if Cursor starts mid-run. `-n` previews without writing. `-y` skips the single warning prompt.
+Close Cursor before any command that writes. `crepath` reads the native process table, aborts if any Cursor instance of any profile is running (including windows started with `--user-data-dir`), and checks again between steps. If the process table cannot be read, writes are refused. `ls`, `stats`, and `history` never wait on this check. `-n` previews without writing. `-y` skips the single warning prompt.
 
 ## Commands
 
@@ -87,7 +87,7 @@ Any command with no arguments opens the picker (space toggles, Enter once, then 
 
 `rx` rebuilds the chat registry from the workspace's `workspace.json`: it fixes stale `workspaceIdentifier` entries, adopts chats that still point at this path from a workspace id that no longer exists, rewrites their old paths, and clears caches.
 
-`ls` columns: dest (present, missing, or none), workspace, kind (folder, code-workspace, unsaved, empty-window, remote), profile, chats, subagents, size, and the first 8 characters of the hash. Missing destinations come first, then the largest workspaces. `--unsaved` limits the table to unsaved sessions.
+`ls` columns: dest (present, missing, or none), workspace, kind (folder, code-workspace, unsaved, empty-window, remote), profile, chats, subagents, size, and the first 8 characters of the hash. Missing destinations come first, then the largest workspaces. `--unsaved` limits the table to unsaved sessions. The profile column names the Cursor installation (see [Profiles](#profiles)), plus `/NAME` for a VS Code profile other than the default one.
 
 `stats` only reports what Cursor records: usage cost and requests, the context size at the last turn, and message tokens, each with the number of conversations that carry it. Message tokens are partial: only counts stored inline in the chat are included, and newer chats store tokens per message. `ls` and `stats` open the databases read-only and never create files next to them.
 
@@ -99,7 +99,7 @@ A missing destination is a warning. That item is skipped.
 | ------------------- | ----------------------------------------------------- |
 | `-n`                | Dry-run. Show the plan and write nothing.             |
 | `-y`                | Skip the single warning prompt.                       |
-| `--profile NAME`    | Limit the run to one Cursor profile.                  |
+| `--profile NAME`    | Limit the run to one Cursor installation.             |
 | `--replace FROM TO` | Batch-rewrite a path prefix.                          |
 | `--regex`           | Treat `--replace` FROM as a regular expression.       |
 | `--unsaved`         | Include or filter unsaved `Workspaces/<ts>` sessions. |
@@ -149,9 +149,17 @@ Workspace ids follow VS Code's formula. A folder hashes its path plus its birth 
 | Linux    | `~/.config/Cursor/User/workspaceStorage/`                     |
 | Windows  | `%APPDATA%\Cursor\User\workspaceStorage\`                     |
 
-`crepath` also updates `workspace.json`, `globalStorage/storage.json`, the matching rows in `globalStorage/state.vscdb`, and `~/.cursor/projects/`. The default user directory and each `userDataProfiles` entry are included. `--profile` filters that set.
+`crepath` also updates `workspace.json`, `globalStorage/storage.json`, the matching rows in `globalStorage/state.vscdb`, and `~/.cursor/projects/`.
 
 Every write command runs as one database transaction with an undo journal in `~/.crepath/backups`: the original image of each row it touches, plus copies of `storage.json` and the workspace files it changes. If a step fails, verification fails, or Cursor starts, everything is rolled back, including folder moves and transcripts. The journal is deleted after a verified run and kept only when a rollback could not finish. Free space is checked up front for the database log, the journal, and any copies.
+
+## Profiles
+
+Every Cursor installation on the machine is a profile: the default user data directory above, any sibling `Cursor*` directory next to it (`Cursor Nightly` becomes `nightly`), and every `~/.cursor-NAME` directory that Cursor was started on with `--user-data-dir ~/.cursor-NAME` (it becomes `NAME`). Each has its own `workspaceStorage`, `globalStorage/state.vscdb`, and `storage.json`. All of them write agent transcripts into the one shared `~/.cursor/projects/`, keyed by folder path.
+
+`ls` and `stats` cover every profile. `stats` counts them and adds a table per profile with its workspaces, chats, subagents, and global database size. `--profile NAME` limits any command to one installation. `--profile NAME/PROFILE` narrows it to one VS Code profile (`userDataProfiles` in `storage.json`) inside it, and a bare VS Code profile name works when only one installation has it.
+
+Write commands never mix installations. Without `--profile` they use the installation that holds the workspace or chat you name, ask in a terminal when several do, and otherwise stop and ask for `--profile`. Sources from different installations are refused, and so is a target that only exists in another installation. When a folder is open in more than one installation, `mv` moves only this installation's transcripts in `~/.cursor/projects/` and copies the rest of that directory, `export` leaves the other installations' transcripts out, and `mv --project` warns that the other installations will point at a missing folder.
 
 ## Build from source
 

@@ -37,6 +37,7 @@ struct Plan {
     owned: HashSet<String>,
     source_headers: usize,
     dest_headers: usize,
+    shared_slug: Vec<String>,
 }
 
 struct Applied {
@@ -163,40 +164,7 @@ fn collect_specs(
         Ok(())
     };
     if let Some((from, to)) = replace {
-        let pattern = if regex {
-            Some(Regex::new(from).with_context(|| format!("invalid regex: {from}"))?)
-        } else {
-            None
-        };
-        for workspace in discover(rt)? {
-            if rt
-                .profile
-                .as_ref()
-                .is_some_and(|name| &workspace.profile != name)
-            {
-                continue;
-            }
-            if workspace.kind == Kind::Remote {
-                continue;
-            }
-            let Some(path) = workspace.path.clone() else {
-                continue;
-            };
-            let path_str = path.to_string_lossy().to_string();
-            let updated = if let Some(pattern) = &pattern {
-                if !pattern.is_match(&path_str) {
-                    continue;
-                }
-                pattern.replace(&path_str, to).into_owned()
-            } else if path_str.contains(from) {
-                path_str.replacen(from, to, 1)
-            } else {
-                continue;
-            };
-            let dest = normalize_path(Path::new(&updated));
-            if dest == path {
-                continue;
-            }
+        for (workspace, dest) in replaced(rt, from, to, regex)? {
             accept(workspace, dest, report)?;
         }
     } else {
@@ -206,6 +174,52 @@ fn collect_specs(
         }
     }
     Ok(specs)
+}
+
+/// Workspaces of the runtime's installation whose path `--replace FROM TO` changes.
+pub fn replaced(
+    rt: &Runtime,
+    from: &str,
+    to: &str,
+    regex: bool,
+) -> Result<Vec<(Workspace, PathBuf)>> {
+    let pattern = if regex {
+        Some(Regex::new(from).with_context(|| format!("invalid regex: {from}"))?)
+    } else {
+        None
+    };
+    let mut found = Vec::new();
+    for workspace in discover(rt)? {
+        if rt
+            .profile
+            .as_ref()
+            .is_some_and(|name| &workspace.profile != name)
+        {
+            continue;
+        }
+        if workspace.kind == Kind::Remote {
+            continue;
+        }
+        let Some(path) = workspace.path.clone() else {
+            continue;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        let updated = if let Some(pattern) = &pattern {
+            if !pattern.is_match(&path_str) {
+                continue;
+            }
+            pattern.replace(&path_str, to).into_owned()
+        } else if path_str.contains(from) {
+            path_str.replacen(from, to, 1)
+        } else {
+            continue;
+        };
+        let dest = normalize_path(Path::new(&updated));
+        if dest != path {
+            found.push((workspace, dest));
+        }
+    }
+    Ok(found)
 }
 
 const PENDING: &str = "pending";
@@ -242,6 +256,7 @@ fn plan_dest(
         kind: Kind::Folder,
         uri: Some(path_uri(dest)),
         path: Some(dest.to_path_buf()),
+        install: rt.layout.name.clone(),
         profile: source.profile.clone(),
         destination_missing: false,
     })
@@ -293,12 +308,39 @@ fn plan_all(
                 );
             }
         }
+        if project
+            && transfer == Transfer::Move
+            && let Some(path) = &source.path
+        {
+            let others = super::path_users(rt, path)?;
+            if !others.is_empty() {
+                let (has, them) = if others.len() == 1 {
+                    ("has a workspace", "it")
+                } else {
+                    ("have workspaces", "them")
+                };
+                report.warnings.push(format!(
+                    "profile {} also {has} on {}; moving the folder leaves {them} pointing at a missing folder",
+                    others.join(", "),
+                    path.display(),
+                ));
+            }
+        }
+        let mut shared_slug = Vec::new();
+        let mut slugs = None;
         if let (Some(old), Some(new)) = (source.slug(), dest.slug())
             && old != new
         {
+            if transfer == Transfer::Move {
+                shared_slug = super::slug_users(rt, &old)?;
+            }
             let from = rt.layout.projects_dir.join(&old);
             let to = rt.layout.projects_dir.join(&new);
-            let conflicts = local::merge_conflicts(&from, &to, transfer == Transfer::Copy)?;
+            let conflicts = local::merge_conflicts(
+                &from,
+                &to,
+                transfer == Transfer::Copy || !shared_slug.is_empty(),
+            )?;
             if let Some(first) = conflicts.first() {
                 bail!(
                     "collision: {} already exists ({} conflicting entries under {})",
@@ -307,13 +349,14 @@ fn plan_all(
                     to.display()
                 );
             }
-            if transfer == Transfer::Copy {
+            if transfer == Transfer::Copy || !shared_slug.is_empty() {
                 needs.add(
                     &rt.layout.projects_dir,
                     dir_size(&from)?,
                     "project data copy",
                 );
             }
+            slugs = Some((old, new));
         }
         let (chats, owned, source_headers, dest_headers) = match &conn {
             Some(conn) => {
@@ -339,6 +382,20 @@ fn plan_all(
             }
             None => (Vec::new(), HashSet::new(), 0, 0),
         };
+        if !shared_slug.is_empty()
+            && let Some((old, new)) = &slugs
+        {
+            let projects = &rt.layout.projects_dir;
+            if let Some(taken) = chats.iter().find(|id| {
+                exists(&local::transcript_dir(projects, old, id))
+                    && exists(&local::transcript_dir(projects, new, id))
+            }) {
+                bail!(
+                    "collision: transcript already exists: {}",
+                    local::transcript_dir(projects, new, taken).display()
+                );
+            }
+        }
         if transfer == Transfer::Copy {
             needs.add(
                 &rt.layout.workspace_storage(),
@@ -364,6 +421,7 @@ fn plan_all(
             owned,
             source_headers,
             dest_headers,
+            shared_slug,
         });
     }
     needs.check()?;
@@ -629,6 +687,18 @@ fn relocate_projects(
     let from = projects.join(&old);
     let to = projects.join(&new);
     match plan.transfer {
+        Transfer::Move if !plan.shared_slug.is_empty() => {
+            local::transfer_transcripts(
+                &mut session.journal,
+                &projects,
+                &old,
+                &new,
+                &plan.chats,
+                None,
+            )?;
+            local::copy_project(&mut session.journal, &from, &to, &HashMap::new(), false)
+                .map(|_| ())
+        }
         Transfer::Move => local::merge_move(&mut session.journal, &from, &to),
         Transfer::Copy => {
             local::copy_project(&mut session.journal, &from, &to, map, false).map(|_| ())

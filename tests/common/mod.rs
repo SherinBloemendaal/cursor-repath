@@ -30,8 +30,19 @@ pub fn cursor_home() -> Home {
     disable_update_check();
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
+    let layout = install_layout(&root, "default", root.join("Cursor"));
+    Home {
+        _tmp: tmp,
+        root,
+        layout,
+    }
+}
+
+/// A second (or further) installation that shares the projects and crepath dirs.
+pub fn install_layout(root: &Path, name: &str, cursor_root: PathBuf) -> Layout {
     let layout = Layout {
-        cursor_root: root.join("Cursor"),
+        name: name.to_string(),
+        cursor_root,
         projects_dir: root.join("dot-cursor/projects"),
         crepath_home: root.join("dot-crepath"),
     };
@@ -42,11 +53,7 @@ pub fn cursor_home() -> Home {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute_batch(GLOBAL_SCHEMA).unwrap();
     drop(conn);
-    Home {
-        _tmp: tmp,
-        root,
-        layout,
-    }
+    layout
 }
 
 pub fn runtime(layout: &Layout, running: bool, dry_run: bool) -> Runtime {
@@ -56,6 +63,8 @@ pub fn runtime(layout: &Layout, running: bool, dry_run: bool) -> Runtime {
 pub fn runtime_with(layout: &Layout, probe: Arc<dyn Probe>, dry_run: bool) -> Runtime {
     Runtime {
         layout: layout.clone(),
+        installs: vec![layout.clone()],
+        pinned: false,
         dry_run,
         yes: true,
         profile: None,

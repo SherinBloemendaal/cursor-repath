@@ -29,6 +29,7 @@ pub fn sort_rows(rows: &mut [ListRow]) {
             .then_with(|| b.size.cmp(&a.size))
             .then_with(|| location(&a.workspace).cmp(&location(&b.workspace)))
             .then_with(|| a.workspace.id.cmp(&b.workspace.id))
+            .then_with(|| a.workspace.install.cmp(&b.workspace.install))
     });
 }
 
@@ -211,7 +212,7 @@ fn path_room(theme: Theme, rows: &[ListRow], total: usize) -> Option<usize> {
         column(2, &|row| {
             format!("{} {}", icons.bullet, row.workspace.kind.label())
         }),
-        column(3, &|row| row.workspace.profile.clone()),
+        column(3, &|row| row.workspace.profile_label()),
         column(4, &|row| ui::count(row.chats as u64)),
         column(5, &|row| ui::count(row.subagents as u64)),
         column(6, &|row| ui::format_size(row.size)),
@@ -241,7 +242,7 @@ pub fn render_list_at(theme: Theme, rows: &[ListRow], total: Option<usize>) -> S
             status_cell(theme, workspace),
             path_cell(theme, workspace, name),
             kind_cell(theme, Some(&workspace.kind)),
-            profile_cell(theme, &workspace.profile),
+            profile_cell(theme, &workspace.profile_label()),
             theme.count_cell(row.chats, None),
             theme.count_cell(row.subagents, Some(Color::Magenta)),
             theme.size_cell(row.size),
@@ -281,11 +282,26 @@ fn list_footer(theme: Theme, rows: &[ListRow]) -> String {
             ))
         )
     };
+    let mut profiles: Vec<String> = rows
+        .iter()
+        .map(|row| row.workspace.profile_label())
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    let workspaces = ui::plural(rows.len(), "workspace", "workspaces");
+    let workspaces = if profiles.len() > 1 {
+        format!(
+            "{} in {}",
+            theme.bold(workspaces),
+            ui::plural(profiles.len(), "profile", "profiles")
+        )
+    } else {
+        theme.bold(workspaces)
+    };
     let parts = [
         format!(
-            "{} {}",
-            theme.paint(icons.square, Style::new().blue()),
-            theme.bold(ui::plural(rows.len(), "workspace", "workspaces"))
+            "{} {workspaces}",
+            theme.paint(icons.square, Style::new().blue())
         ),
         missing,
         format!(
@@ -345,7 +361,7 @@ pub fn render_detail(theme: Theme, row: &ListRow, headers: &[ComposerHeader]) ->
         ("Path", path_cell(theme, workspace, location(workspace))),
         ("Destination", destination_cell),
         ("Kind", kind_cell(theme, Some(&workspace.kind))),
-        ("Profile", profile_cell(theme, &workspace.profile)),
+        ("Profile", profile_cell(theme, &workspace.profile_label())),
         ("Hash", theme.cell(&workspace.id, Some(Color::Magenta), &[])),
     ];
     if let Some(uri) = &workspace.uri {
@@ -613,6 +629,7 @@ mod tests {
                 kind: Kind::Folder,
                 uri: Some(format!("file:///tmp/{id}")),
                 path: Some(PathBuf::from(format!("/tmp/{id}"))),
+                install: "default".to_string(),
                 profile: "default".to_string(),
                 destination_missing: missing,
             },

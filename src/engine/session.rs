@@ -159,6 +159,7 @@ mod tests {
 
     fn runtime(root: &std::path::Path) -> Runtime {
         let layout = Layout {
+            name: "default".to_string(),
             cursor_root: root.join("Cursor"),
             projects_dir: root.join("projects"),
             crepath_home: root.join("crepath"),
@@ -174,7 +175,9 @@ mod tests {
         )
         .unwrap();
         Runtime {
+            installs: vec![layout.clone()],
             layout,
+            pinned: false,
             dry_run: false,
             yes: true,
             profile: None,

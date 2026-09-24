@@ -354,7 +354,13 @@ impl<'a> Writer<'a> {
             .context("composerHeaders row without composerId")?
             .to_string();
         self.journal.record_row(self.conn, Table::Headers, &id)?;
-        let columns: Vec<&str> = row.columns.iter().map(|(name, _)| name.as_str()).collect();
+        let known = crate::cursor::registry::table_columns(self.conn, "composerHeaders")?;
+        let kept: Vec<&(String, Value)> = row
+            .columns
+            .iter()
+            .filter(|(name, _)| known.contains(name))
+            .collect();
+        let columns: Vec<&str> = kept.iter().map(|(name, _)| name.as_str()).collect();
         let marks: Vec<String> = (1..=columns.len())
             .map(|index| format!("?{index}"))
             .collect();
@@ -364,7 +370,7 @@ impl<'a> Writer<'a> {
                 columns.join(", "),
                 marks.join(", ")
             ))?
-            .execute(params_from_iter(row.columns.iter().map(|(_, value)| value)))?;
+            .execute(params_from_iter(kept.iter().map(|(_, value)| value)))?;
         Ok(())
     }
 

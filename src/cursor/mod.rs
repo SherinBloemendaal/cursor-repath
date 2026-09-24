@@ -2,6 +2,8 @@
 
 pub mod chat_sessions;
 pub mod folder_id;
+pub mod install;
+pub mod process;
 pub mod registry;
 pub mod rewrite;
 pub mod sqlite_value;

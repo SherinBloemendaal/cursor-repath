@@ -9,25 +9,29 @@ pub fn cursor_projects_dir() -> Result<PathBuf> {
     Ok(home.join(".cursor").join("projects"))
 }
 
-/// Get the Cursor configuration directory
-/// - macOS: ~/Library/Application Support/Cursor/
-/// - Linux: ~/.config/Cursor/
-/// - Windows: %APPDATA%/Cursor/
-pub fn cursor_config_dir() -> Result<PathBuf> {
+/// Directory that holds Electron user data directories
+/// - macOS: ~/Library/Application Support/
+/// - Linux: ~/.config/
+/// - Windows: %APPDATA%/
+pub fn app_data_dir() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().context("Could not determine home directory")?;
-        Ok(home
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor"))
+        Ok(home.join("Library").join("Application Support"))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let config = dirs::config_dir().context("Could not determine config directory")?;
-        Ok(config.join("Cursor"))
+        dirs::config_dir().context("Could not determine config directory")
     }
+}
+
+/// Get the default Cursor user data directory
+/// - macOS: ~/Library/Application Support/Cursor/
+/// - Linux: ~/.config/Cursor/
+/// - Windows: %APPDATA%/Cursor/
+pub fn cursor_config_dir() -> Result<PathBuf> {
+    Ok(app_data_dir()?.join("Cursor"))
 }
 
 /// Get the Cursor workspace storage directory

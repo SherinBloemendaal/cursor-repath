@@ -6,13 +6,14 @@ use comfy_table::{Attribute, Cell, CellAlignment, Color};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use super::fsops::dir_size;
 use super::view::{display_name, header_workspace, kind_cell, workspace_name};
-use super::{Kind, Runtime, discover, open_global_ro};
+use super::{Kind, Runtime, filtered_workspaces, open_global_ro, user_profiles};
+use crate::cursor::install;
 use crate::cursor::registry::{ComposerHeader, load_headers};
 use crate::engine::db;
 use crate::ui::{self, Align, Sheet, Theme};
@@ -39,8 +40,37 @@ pub struct Usage {
     pub token_chats: usize,
 }
 
+impl Usage {
+    fn absorb(&mut self, other: &Usage) {
+        self.conversations += other.conversations;
+        self.cost_cents += other.cost_cents;
+        self.requests += other.requests;
+        self.cost_chats += other.cost_chats;
+        self.context_tokens += other.context_tokens;
+        self.context_chats += other.context_chats;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.token_chats += other.token_chats;
+    }
+}
+
+/// One installation, or one VS Code profile inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRow {
+    pub name: String,
+    pub root: String,
+    pub workspaces: usize,
+    pub chats: usize,
+    pub subagents: usize,
+    pub global_db: Option<u64>,
+    pub user_profile: bool,
+}
+
+#[derive(Default)]
 pub struct Stats {
-    pub profiles: usize,
+    pub installations: usize,
+    pub user_profiles: usize,
+    pub profiles: Vec<ProfileRow>,
     pub workspaces: usize,
     pub by_kind: Vec<(Kind, usize)>,
     pub chats: usize,
@@ -59,24 +89,64 @@ pub fn render(rt: &Runtime, theme: Theme) -> Result<String> {
 }
 
 pub fn collect(rt: &Runtime) -> Result<Stats> {
-    let workspaces = discover(rt)?;
-    let mut by_kind: Vec<(Kind, usize)> = Vec::new();
+    let scopes = rt.scope();
+    let mut stats = Stats {
+        installations: scopes.len(),
+        ..Stats::default()
+    };
+    for scoped in &scopes {
+        collect_into(scoped, scopes.len() > 1, &mut stats)?;
+    }
+    stats
+        .by_kind
+        .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label().cmp(b.0.label())));
+    stats
+        .busiest
+        .sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.name.cmp(&b.name)));
+    stats
+        .workspace_dbs
+        .sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.name.cmp(&b.name)));
+    Ok(stats)
+}
+
+fn collect_into(rt: &Runtime, labelled: bool, stats: &mut Stats) -> Result<()> {
+    let install = rt.layout.name.as_str();
+    let tag = |name: String| {
+        if labelled {
+            format!("{name} ({install})")
+        } else {
+            name
+        }
+    };
+    let workspaces = filtered_workspaces(rt, false)?;
     for workspace in &workspaces {
-        match by_kind.iter_mut().find(|(kind, _)| *kind == workspace.kind) {
+        match stats
+            .by_kind
+            .iter_mut()
+            .find(|(kind, _)| *kind == workspace.kind)
+        {
             Some((_, count)) => *count += 1,
-            None => by_kind.push((workspace.kind.clone(), 1)),
+            None => stats.by_kind.push((workspace.kind.clone(), 1)),
         }
     }
-    by_kind.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label().cmp(b.0.label())));
     let conn = open_global_ro(rt)?;
-    let headers = match &conn {
+    let mut headers = match &conn {
         Some(conn) => load_headers(conn)?,
         None => Vec::new(),
     };
+    if rt.profile.is_some() {
+        let ids: HashSet<&str> = workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect();
+        headers.retain(|header| ids.contains(header.workspace_id.as_str()));
+    }
     let chats = headers.iter().filter(|header| !header.is_subagent).count();
     let subagents = headers.iter().filter(|header| header.is_subagent).count();
-    let archived = headers.iter().filter(|header| header.is_archived).count();
-    let mut per_month: BTreeMap<String, usize> = BTreeMap::new();
+    stats.workspaces += workspaces.len();
+    stats.chats += chats;
+    stats.subagents += subagents;
+    stats.archived += headers.iter().filter(|header| header.is_archived).count();
     let mut per_workspace: BTreeMap<String, (usize, &ComposerHeader)> = BTreeMap::new();
     for header in &headers {
         if header.is_subagent {
@@ -89,12 +159,13 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
         if let Some(created) = header.created_at
             && let Some(stamp) = Utc.timestamp_millis_opt(created).single()
         {
-            *per_month
+            *stats
+                .per_month
                 .entry(stamp.format("%Y-%m").to_string())
                 .or_default() += 1;
         }
     }
-    let (usage, models) = match &conn {
+    let (found, models) = match &conn {
         Some(conn) => usage(conn, &headers)?,
         None => (
             Usage {
@@ -104,6 +175,10 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
             BTreeMap::new(),
         ),
     };
+    stats.usage.absorb(&found);
+    for (model, count) in models {
+        *stats.models.entry(model).or_default() += count;
+    }
     let known: HashMap<&str, (String, Kind)> = workspaces
         .iter()
         .map(|workspace| {
@@ -113,9 +188,9 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
             )
         })
         .collect();
-    let mut busiest: Vec<Named> = per_workspace
-        .into_iter()
-        .map(|(id, (count, header))| {
+    stats
+        .busiest
+        .extend(per_workspace.into_iter().map(|(id, (count, header))| {
             let (name, kind) = match known.get(id.as_str()) {
                 Some((name, kind)) => (name.clone(), Some(kind.clone())),
                 None => {
@@ -124,38 +199,63 @@ pub fn collect(rt: &Runtime) -> Result<Stats> {
                 }
             };
             Named {
-                name,
+                name: tag(name),
                 kind,
                 value: count as u64,
             }
-        })
-        .collect();
-    busiest.sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.name.cmp(&b.name)));
-    let mut workspace_dbs: Vec<Named> = workspaces
-        .iter()
-        .filter_map(|workspace| {
+        }));
+    stats
+        .workspace_dbs
+        .extend(workspaces.iter().filter_map(|workspace| {
             file_len(&workspace.dir.join("state.vscdb")).map(|size| Named {
-                name: workspace_name(workspace),
+                name: tag(workspace_name(workspace)),
                 kind: Some(workspace.kind.clone()),
                 value: size,
             })
-        })
-        .collect();
-    workspace_dbs.sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.name.cmp(&b.name)));
-    Ok(Stats {
-        profiles: profile_count(rt),
+        }));
+    let global_db = file_len(&rt.layout.global_db());
+    if let Some(size) = global_db {
+        stats.global_db = Some(stats.global_db.unwrap_or(0) + size);
+    }
+    let root = ui::home_relative(&rt.layout.cursor_root.display().to_string());
+    let name = match &rt.profile {
+        Some(profile) if profile != install::DEFAULT => format!("{install}/{profile}"),
+        _ => install.to_string(),
+    };
+    stats.profiles.push(ProfileRow {
+        name,
+        root: root.clone(),
         workspaces: workspaces.len(),
-        by_kind,
         chats,
         subagents,
-        archived,
-        usage,
-        models,
-        per_month,
-        busiest,
-        global_db: file_len(&rt.layout.global_db()),
-        workspace_dbs,
-    })
+        global_db,
+        user_profile: false,
+    });
+    if rt.profile.is_some() {
+        return Ok(());
+    }
+    for profile in user_profiles(rt)? {
+        let ids: HashSet<&str> = workspaces
+            .iter()
+            .filter(|workspace| workspace.profile == profile.name)
+            .map(|workspace| workspace.id.as_str())
+            .collect();
+        let owned: Vec<&ComposerHeader> = headers
+            .iter()
+            .filter(|header| ids.contains(header.workspace_id.as_str()))
+            .collect();
+        stats.user_profiles += 1;
+        stats.profiles.push(ProfileRow {
+            name: format!("{install}/{}", profile.name),
+            root: root.clone(),
+            workspaces: ids.len(),
+            chats: owned.iter().filter(|header| !header.is_subagent).count(),
+            subagents: owned.iter().filter(|header| header.is_subagent).count(),
+            global_db: None,
+            user_profile: true,
+        });
+    }
+    Ok(())
 }
 
 fn left(theme: Theme, text: impl std::fmt::Display) -> Cell {
@@ -220,8 +320,23 @@ fn overview(theme: Theme, stats: &Stats) -> Sheet {
     let mut rows = vec![
         (
             "Profiles",
-            value(ui::plural(stats.profiles, "profile", "profiles"), None),
-            "Cursor profiles in storage.json".to_string(),
+            value(
+                ui::plural(stats.profiles.len(), "profile", "profiles"),
+                None,
+            ),
+            format!(
+                "{} with {}",
+                ui::plural(
+                    stats.installations,
+                    "Cursor installation",
+                    "Cursor installations"
+                ),
+                if stats.user_profiles == 0 {
+                    "no extra VS Code profiles".to_string()
+                } else {
+                    ui::plural(stats.user_profiles, "VS Code profile", "VS Code profiles")
+                }
+            ),
         ),
         (
             "Workspaces",
@@ -306,7 +421,14 @@ fn overview(theme: Theme, stats: &Stats) -> Sheet {
         rows.push((
             "Global db",
             value(ui::format_size(size), None),
-            "globalStorage/state.vscdb".to_string(),
+            if stats.installations > 1 {
+                format!(
+                    "globalStorage/state.vscdb in {}",
+                    ui::plural(stats.installations, "installation", "installations")
+                )
+            } else {
+                "globalStorage/state.vscdb".to_string()
+            },
         ));
     }
     if !stats.workspace_dbs.is_empty() {
@@ -322,6 +444,109 @@ fn overview(theme: Theme, stats: &Stats) -> Sheet {
     }
     for (name, cell, detail) in rows {
         sheet.row(vec![metric(name), cell, dim(theme, detail)]);
+    }
+    sheet
+}
+
+fn profiles(theme: Theme, stats: &Stats) -> Sheet {
+    profiles_at(theme, stats, ui::table_width())
+}
+
+fn profiles_at(theme: Theme, stats: &Stats, width: Option<usize>) -> Sheet {
+    let rows = &stats.profiles;
+    let db_text = |row: &ProfileRow| match row.global_db {
+        Some(size) => ui::format_size(size),
+        None if row.user_profile => "shared".to_string(),
+        None => "none".to_string(),
+    };
+    let total_db: u64 = rows.iter().filter_map(|row| row.global_db).sum();
+    let names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+    let dbs: Vec<String> = rows
+        .iter()
+        .map(db_text)
+        .chain([ui::format_size(total_db)])
+        .collect();
+    let column = |header: &str, pick: fn(&ProfileRow) -> usize| {
+        let cells: Vec<String> = rows
+            .iter()
+            .map(|row| ui::count(pick(row) as u64))
+            .chain([ui::count(
+                rows.iter()
+                    .filter(|row| !row.user_profile)
+                    .map(|row| pick(row) as u64)
+                    .sum(),
+            )])
+            .collect();
+        ui::column_width(header, cells.iter().map(String::as_str))
+    };
+    let room = width.and_then(|width| {
+        ui::flex_room(
+            width,
+            &[
+                ui::column_width(
+                    "profile",
+                    names.iter().map(String::as_str).chain(["all profiles"]),
+                ),
+                column("workspaces", |row| row.workspaces),
+                column("chats", |row| row.chats),
+                column("subagents", |row| row.subagents),
+                ui::column_width("global db", dbs.iter().map(String::as_str)),
+            ],
+        )
+    });
+    let fit = |path: &str| match room {
+        Some(room) => ui::layout::keep_tail(path, room, theme.icons().ellipsis),
+        None => path.to_string(),
+    };
+    let mut sheet = Sheet::new(
+        theme,
+        &[
+            ("profile", Align::Left),
+            ("user data", Align::Left),
+            ("workspaces", Align::Right),
+            ("chats", Align::Right),
+            ("subagents", Align::Right),
+            ("global db", Align::Right),
+        ],
+    )
+    .flex(1);
+    for row in rows {
+        let name = if row.name == install::DEFAULT {
+            theme.cell(&row.name, None, &[Attribute::Dim])
+        } else {
+            theme.cell(&row.name, Some(Color::Cyan), &[Attribute::Bold])
+        };
+        let root = if row.user_profile {
+            dim(theme, fit(&row.root))
+        } else {
+            theme.cell(fit(&row.root), Some(Color::Cyan), &[])
+        };
+        let db = match row.global_db {
+            Some(size) => theme.size_cell(size),
+            None => dim(theme, db_text(row)).set_alignment(CellAlignment::Right),
+        };
+        sheet.row(vec![
+            name,
+            root,
+            number(theme, row.workspaces as u64),
+            theme.count_cell(row.chats, None),
+            theme.count_cell(row.subagents, Some(Color::Magenta)),
+            db,
+        ]);
+    }
+    if rows.len() > 1 {
+        let installs = rows.iter().filter(|row| !row.user_profile);
+        let sum = |pick: fn(&ProfileRow) -> usize| -> u64 {
+            installs.clone().map(|row| pick(row) as u64).sum()
+        };
+        sheet.total(vec![
+            left(theme, "all profiles"),
+            left(theme, ""),
+            number(theme, sum(|row| row.workspaces)),
+            number(theme, sum(|row| row.chats)),
+            number(theme, sum(|row| row.subagents)),
+            theme.size_cell(total_db),
+        ]);
     }
     sheet
 }
@@ -553,6 +778,7 @@ fn months(theme: Theme, stats: &Stats) -> Sheet {
 pub fn sections(theme: Theme, stats: &Stats) -> Vec<(&'static str, Sheet)> {
     vec![
         ("Overview", overview(theme, stats)),
+        ("Profiles", profiles(theme, stats)),
         ("Workspaces by kind", kinds(theme, stats)),
         ("Top models", models(theme, stats)),
         (
@@ -666,20 +892,6 @@ pub fn add_usage(usage: &mut Usage, json: &Value) {
     }
 }
 
-fn profile_count(rt: &Runtime) -> usize {
-    let path = rt.layout.storage_json();
-    if !path.exists() {
-        return 1;
-    }
-    let Ok(raw) = fs::read_to_string(path) else {
-        return 1;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
-        return 1;
-    };
-    super::profiles_from_storage(&json).len()
-}
-
 fn file_len(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|meta| meta.len()).or_else(|| {
         if path.is_dir() {
@@ -716,7 +928,37 @@ mod tests {
             value: 1,
         });
         Stats {
-            profiles: 2,
+            installations: 2,
+            user_profiles: 1,
+            profiles: vec![
+                ProfileRow {
+                    name: "default".to_string(),
+                    root: "~/Library/Application Support/Cursor".to_string(),
+                    workspaces: 2,
+                    chats: 1_000,
+                    subagents: 30,
+                    global_db: Some(2 * 1024 * 1024 * 1024),
+                    user_profile: false,
+                },
+                ProfileRow {
+                    name: "default/Work".to_string(),
+                    root: "~/Library/Application Support/Cursor".to_string(),
+                    workspaces: 1,
+                    chats: 400,
+                    subagents: 5,
+                    global_db: None,
+                    user_profile: true,
+                },
+                ProfileRow {
+                    name: "resolved".to_string(),
+                    root: "~/.cursor-resolved".to_string(),
+                    workspaces: 1,
+                    chats: 200,
+                    subagents: 10,
+                    global_db: Some(1024 * 1024 * 1024),
+                    user_profile: false,
+                },
+            ],
             workspaces: 3,
             by_kind: vec![(Kind::Folder, 2), (Kind::Unsaved, 1)],
             chats: 1_200,
@@ -776,6 +1018,7 @@ mod tests {
         let out = render_stats(Theme::plain(), &sample());
         for section in [
             "==> Overview",
+            "==> Profiles",
             "==> Workspaces by kind",
             "==> Top models",
             "==> Busiest workspaces",
@@ -786,7 +1029,16 @@ mod tests {
         }
         for text in [
             "│ metric ",
-            "2 profiles",
+            "3 profiles",
+            "2 Cursor installations with 1 VS Code profile",
+            "globalStorage/state.vscdb in 2 installations",
+            "│ profile      │ user data",
+            "│ workspaces │ chats │ subagents │ global db │",
+            "│ default/Work │",
+            "│ resolved     │ ~/.cursor-resolved",
+            "shared",
+            "all profiles",
+            "1,200",
             "3 workspaces",
             "2 folder, 1 unsaved",
             "1,200 chats",
@@ -861,18 +1113,8 @@ mod tests {
     #[test]
     fn empty_stats_say_none_yet() {
         let stats = Stats {
-            profiles: 1,
-            workspaces: 0,
-            by_kind: Vec::new(),
-            chats: 0,
-            subagents: 0,
-            archived: 0,
-            usage: Usage::default(),
-            models: BTreeMap::new(),
-            per_month: BTreeMap::new(),
-            busiest: Vec::new(),
-            global_db: None,
-            workspace_dbs: Vec::new(),
+            installations: 1,
+            ..Stats::default()
         };
         let out = render_stats(Theme::plain(), &stats);
         assert!(out.contains("none yet"));

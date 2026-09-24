@@ -78,6 +78,30 @@ pub fn composer_headers_table(conn: &Connection) -> Result<bool> {
     table_exists(conn, "composerHeaders")
 }
 
+pub fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached("SELECT name FROM pragma_table_info(?1)")?;
+    let names = stmt
+        .query_map([table], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()
+        .with_context(|| format!("failed to read the columns of {table}"))?;
+    Ok(names)
+}
+
+/// `composerHeaders` columns in `ComposerHeader` order; older Cursor builds have no
+/// `subagentTypeName` column.
+fn header_fields(conn: &Connection) -> Result<&'static str> {
+    let has_type = table_columns(conn, "composerHeaders")?
+        .iter()
+        .any(|name| name == "subagentTypeName");
+    Ok(if has_type {
+        "composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
+         recency, checkpointAt, value, subagentTypeName"
+    } else {
+        "composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
+         recency, checkpointAt, value, NULL"
+    })
+}
+
 /// Read registry rows. Uses `composerHeaders` when that table exists, otherwise the legacy key.
 pub fn load_headers(conn: &Connection) -> Result<Vec<ComposerHeader>> {
     if composer_headers_table(conn)? {
@@ -101,11 +125,10 @@ pub fn load_headers_for_workspace(
 
 pub fn load_header(conn: &Connection, composer_id: &str) -> Result<Option<ComposerHeader>> {
     if composer_headers_table(conn)? {
-        let mut stmt = conn.prepare_cached(
-            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
-             recency, checkpointAt, value, subagentTypeName \
-             FROM composerHeaders WHERE composerId = ?1",
-        )?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM composerHeaders WHERE composerId = ?1",
+            header_fields(conn)?
+        ))?;
         return stmt
             .query_row(params![composer_id], map_row)
             .optional()
@@ -139,20 +162,13 @@ fn load_headers_table(
     conn: &Connection,
     workspace_id: Option<&str>,
 ) -> Result<Vec<ComposerHeader>> {
+    let fields = header_fields(conn)?;
     let sql = match workspace_id {
-        Some(_) => {
-            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
-             recency, checkpointAt, value, subagentTypeName \
-             FROM composerHeaders WHERE workspaceId = ?1"
-        }
-        None => {
-            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, \
-             recency, checkpointAt, value, subagentTypeName \
-             FROM composerHeaders"
-        }
+        Some(_) => format!("SELECT {fields} FROM composerHeaders WHERE workspaceId = ?1"),
+        None => format!("SELECT {fields} FROM composerHeaders"),
     };
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .context("failed to prepare composerHeaders query")?;
     let rows = if let Some(workspace_id) = workspace_id {
         stmt.query_map(params![workspace_id], map_row)?

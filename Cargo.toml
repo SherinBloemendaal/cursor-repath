@@ -37,6 +37,7 @@ aho-corasick = "1.1.5"
 base64 = "0.23.1"
 console = "0.16"
 unicode-width = "0.2"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.5", features = ["fs"] }
