@@ -104,37 +104,36 @@ fn walk_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn rewrites_backup_folders_and_profile_keys() {
-        let mut file = NamedTempFile::new().unwrap();
-        write!(
-            file,
-            r#"{{
-    "backupWorkspaces": {{
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.json");
+        fs::write(
+            &path,
+            r#"{
+    "backupWorkspaces": {
         "folders": [
-            {{ "folderUri": "file:///old/path" }},
-            {{ "folderUri": "file:///other/path" }}
+            { "folderUri": "file:///old/path" },
+            { "folderUri": "file:///other/path" }
         ]
-    }},
-    "profileAssociations": {{
-        "workspaces": {{
+    },
+    "profileAssociations": {
+        "workspaces": {
             "file:///old/path": "__default__profile__"
-        }}
-    }}
-}}"#
+        }
+    }
+}"#,
         )
         .unwrap();
         let rewritten = rewrite_storage_json(
-            file.path(),
+            &path,
             &[Replacement::new("file:///old/path", "file:///new/path")],
             false,
         )
         .unwrap();
         assert!(!rewritten.is_empty());
-        let content = fs::read_to_string(file.path()).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("file:///new/path"));
         assert!(!content.contains("file:///old/path"));
         assert!(content.contains("file:///other/path"));
