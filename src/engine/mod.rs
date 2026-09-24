@@ -752,6 +752,7 @@ fn preflight(
     Ok(planned)
 }
 
+#[cfg(unix)]
 fn free_bytes(path: &Path) -> Option<u64> {
     let text = path.to_string_lossy();
     let c_path = std::ffi::CString::new(text.as_bytes()).ok()?;
@@ -762,6 +763,30 @@ fn free_bytes(path: &Path) -> Option<u64> {
         }
         Some(u64::from(stat.f_bavail).saturating_mul(stat.f_frsize))
     }
+}
+
+#[cfg(windows)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // GetDiskFreeSpaceExW only accepts directories; `.code-workspace` destinations are files.
+    let dir = if path.is_file() { path.parent()? } else { path };
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
 }
 
 fn plan_one(source: &Workspace, dest: &Path, project: bool, transfer: Transfer) -> Result<Planned> {
@@ -1638,4 +1663,32 @@ pub fn profiles_from_storage(json: &Value) -> Vec<String> {
 
 pub fn load_registry(conn: &Connection) -> Result<Vec<ComposerHeader>> {
     registry::load_headers(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_bytes_reports_space_for_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(free_bytes(dir.path()).is_some_and(|free| free > 0));
+    }
+
+    #[test]
+    fn free_bytes_reports_space_for_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("project.code-workspace");
+        fs::write(&file, "{}").unwrap();
+
+        assert!(free_bytes(&file).is_some_and(|free| free > 0));
+    }
+
+    #[test]
+    fn free_bytes_is_none_for_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(free_bytes(&dir.path().join("missing").join("deeper")), None);
+    }
 }
