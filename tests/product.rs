@@ -22,9 +22,9 @@ use tempfile::TempDir;
 #[test]
 fn mv_replace_skips_missing_destination_with_warning() {
     let home = cursor_home();
-    let one = home.root.join("noble/one");
-    let two = home.root.join("noble/two");
-    let dest_one = home.root.join("resolute/one");
+    let one = native(&home.root, "noble/one");
+    let two = native(&home.root, "noble/two");
+    let dest_one = native(&home.root, "resolute/one");
     fs::create_dir_all(&one).unwrap();
     fs::create_dir_all(&two).unwrap();
     fs::create_dir_all(&dest_one).unwrap();
@@ -153,9 +153,9 @@ fn split_autosuggest_blocks_unassigned_copy_keeps_source_and_move_empties() {
     fs::create_dir_all(web.join("src")).unwrap();
     write_folder_workspace(&home.layout, "source-hash", &source_path);
     let identity = folder_identity("source-hash", &source_path);
-    let api_file = api.join("src/main.rs");
+    let api_file = native(&api, "src/main.rs");
     fs::write(&api_file, "fn main() {}\n").unwrap();
-    let web_file = web.join("src/new.ts");
+    let web_file = native(&web, "src/new.ts");
     for id in [A, B, C] {
         insert_header(
             &home.layout,
@@ -521,9 +521,9 @@ fn registry_reads_composer_headers_and_falls_back() {
 #[test]
 fn mv_touches_only_the_workspace_and_skips_sibling_prefix() {
     let home = cursor_home();
-    let project = home.root.join("user/project");
-    let copy = home.root.join("user/project-copy");
-    let sibling = home.root.join("user/projects/foo");
+    let project = native(&home.root, "user/project");
+    let copy = native(&home.root, "user/project-copy");
+    let sibling = native(&home.root, "user/projects/foo");
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&copy).unwrap();
     write_folder_workspace(&home.layout, "oldhash", &project);
