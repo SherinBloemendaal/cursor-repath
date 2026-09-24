@@ -6,9 +6,9 @@ pub mod registry;
 pub mod rewrite;
 pub mod sqlite_value;
 pub mod storage;
+pub mod uri;
 pub mod workspace;
 
-// Re-exports for library consumers
 #[allow(unused_imports)]
 pub use folder_id::path_to_folder_id;
 #[allow(unused_imports)]
