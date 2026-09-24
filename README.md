@@ -7,13 +7,19 @@
 ### macOS / Linux
 
 ```bash
+curl -fsSL https://sherin.dev/crepath/install.sh | bash
+```
+
+Same script from GitHub, if sherin.dev is unavailable:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.sh | bash
 ```
 
 Pin a release with `bash -s`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SherinBloemendaal/cursor-repath/main/install.sh | bash -s v1.0.0
+curl -fsSL https://sherin.dev/crepath/install.sh | bash -s v1.0.0
 ```
 
 The script installs `crepath` to `~/.crepath/bin` (override with `CREPATH_INSTALL`). It adds that directory to your zsh, bash, or fish config when the line is missing. Run it again to upgrade in place.
