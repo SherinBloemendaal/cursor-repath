@@ -1,28 +1,37 @@
 //! Shared Cursor repath engine.
 
+mod archive;
+mod chats;
 mod db;
+mod fsops;
+mod journal;
+mod local;
+mod repath;
+mod session;
+mod sql;
+mod stats;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::Utc;
-use fs_extra::dir::{self, CopyOptions};
-use regex::Regex;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use url::Url;
 
-use crate::cursor::folder_id::path_to_folder_id;
 use crate::cursor::registry::{self, ComposerHeader};
-use crate::cursor::rewrite::Replacement;
-use crate::cursor::storage::rewrite_storage_json;
-use crate::cursor::workspace::{self, compute_workspace_hash};
-use crate::ui::{self, DualProgress};
+use crate::cursor::uri::{self, Platform, normalize_path, path_uri, uri_path};
+use crate::cursor::workspace::{self, compute_workspace_hash, is_workspace_file};
+use crate::ui;
 
-pub use db::{rewrite_workspace, touched_paths};
+pub use archive::{export_workspace, import_archive};
+pub use chats::{
+    SplitSuggestion, combine_workspaces, reindex, remove_targets, split_workspace, suggest_split,
+};
+pub use db::touched_paths;
+pub use repath::{copy_paths, move_paths, save_unsaved};
 
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -98,7 +107,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn check(&self) -> Result<()> {
         if self.probe.running() {
-            bail!("Cursor is running. Close Cursor completely and retry.");
+            anyhow::bail!("Cursor is running. Close Cursor completely and retry.");
         }
         Ok(())
     }
@@ -110,6 +119,7 @@ pub enum Kind {
     CodeWorkspace,
     Unsaved,
     EmptyWindow,
+    Remote,
 }
 
 impl Kind {
@@ -119,6 +129,7 @@ impl Kind {
             Self::CodeWorkspace => "code-workspace",
             Self::Unsaved => "unsaved",
             Self::EmptyWindow => "empty-window",
+            Self::Remote => "remote",
         }
     }
 }
@@ -134,398 +145,98 @@ pub struct Workspace {
     pub destination_missing: bool,
 }
 
+fn uri_components(path: &Path) -> Value {
+    let platform = Platform::current();
+    let text = path.to_string_lossy();
+    let (authority, uri_path) = uri::uri_parts(platform, &text);
+    let mut components = json!({
+        "$mid": 1,
+        "fsPath": uri::fs_path(platform, &text),
+        "external": uri::file_uri(platform, &text),
+        "path": uri_path,
+        "scheme": "file",
+    });
+    if !authority.is_empty()
+        && let Some(object) = components.as_object_mut()
+    {
+        object.insert("authority".to_string(), Value::String(authority));
+    }
+    components
+}
+
+impl Workspace {
+    /// `workspaceIdentifier` as Cursor stores it in chat headers.
+    pub fn identity(&self) -> Value {
+        match (&self.kind, &self.path) {
+            (Kind::Folder, Some(path)) => json!({"id": self.id, "uri": uri_components(path)}),
+            (Kind::CodeWorkspace | Kind::Unsaved, Some(path)) => {
+                json!({"id": self.id, "configPath": uri_components(path)})
+            }
+            _ => json!({"id": self.id}),
+        }
+    }
+
+    /// Target that Cursor would create for `path` (a folder or a workspace file).
+    pub fn planned(layout: &Layout, path: &Path) -> Result<Self> {
+        let path = normalize_path(path);
+        let id = compute_workspace_hash(&path)?;
+        let kind = if is_workspace_file(&path) {
+            if path.starts_with(normalize_path(&layout.unsaved_root())) {
+                Kind::Unsaved
+            } else {
+                Kind::CodeWorkspace
+            }
+        } else {
+            Kind::Folder
+        };
+        Ok(Self {
+            dir: layout.workspace_storage().join(&id),
+            id,
+            kind,
+            uri: Some(path_uri(&path)),
+            path: Some(path),
+            profile: "default".to_string(),
+            destination_missing: false,
+        })
+    }
+
+    /// Directory name under `~/.cursor/projects`.
+    pub fn slug(&self) -> Option<String> {
+        match self.kind {
+            Kind::Folder | Kind::CodeWorkspace => self
+                .path
+                .as_ref()
+                .map(crate::cursor::folder_id::path_to_folder_id),
+            Kind::Unsaved => self
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().to_string()),
+            Kind::EmptyWindow => self
+                .id
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+                .then(|| self.id.clone()),
+            Kind::Remote => None,
+        }
+    }
+
+    pub fn workspace_json(&self) -> Result<Value> {
+        let uri = self.uri.clone().context("workspace has no uri")?;
+        Ok(match self.kind {
+            Kind::CodeWorkspace | Kind::Unsaved => json!({ "workspace": uri }),
+            _ => json!({ "folder": uri }),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub warnings: Vec<String>,
     pub skipped: Vec<String>,
     pub applied: Vec<String>,
     pub rewritten_keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transfer {
-    Move,
-    Copy,
-}
-
-#[derive(Debug, Clone)]
-struct Planned {
-    source: Workspace,
-    dest: PathBuf,
-    dest_uri: String,
-    new_hash: String,
-    project: bool,
-    transfer: Transfer,
-}
-
-pub fn move_paths(
-    rt: &Runtime,
-    pairs: &[(String, String)],
-    replace: Option<(&str, &str)>,
-    regex: bool,
-    project: bool,
-) -> Result<Report> {
-    repath(rt, pairs, replace, regex, project, Transfer::Move)
-}
-
-pub fn copy_paths(
-    rt: &Runtime,
-    pairs: &[(String, String)],
-    replace: Option<(&str, &str)>,
-    regex: bool,
-    project: bool,
-) -> Result<Report> {
-    repath(rt, pairs, replace, regex, project, Transfer::Copy)
-}
-
-pub fn save_unsaved(rt: &Runtime, id: &str, dest: &Path) -> Result<Report> {
-    rt.check()?;
-    let workspaces = discover(rt)?;
-    let source = workspaces
-        .into_iter()
-        .find(|workspace| is_unsaved_id(workspace, id))
-        .with_context(|| format!("no unsaved workspace matches {id}"))?;
-    if !dest.exists() {
-        bail!("destination does not exist: {}", dest.display());
-    }
-    let dest = abs_path(dest);
-    let planned = plan_one(&source, &dest, false, Transfer::Move)?;
-    let mut report = Report::default();
-    apply_plans(rt, &[planned], &mut report)?;
-    Ok(report)
-}
-
-pub fn suggest_split(
-    rt: &Runtime,
-    source: &Workspace,
-    targets: &[PathBuf],
-) -> Result<SplitSuggestion> {
-    let conn = open_global(rt)?;
-    let headers = db::headers(&conn, &source.id)?;
-    let mut assigned: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let mut unassigned = Vec::new();
-    let roots: Vec<PathBuf> = targets.iter().map(|path| abs_path(path)).collect();
-    for header in headers.iter().filter(|header| !header.is_subagent) {
-        let paths = db::touched_paths(&conn, &header.composer_id)?;
-        let mut hits = Vec::new();
-        for raw in paths {
-            if let Some(path) = materialize_path(&raw)
-                && let Some(target) = longest_target(&path, &roots)
-                && !hits.iter().any(|existing: &PathBuf| existing == &target)
-            {
-                hits.push(target);
-            }
-        }
-        if hits.is_empty() {
-            unassigned.push(header.composer_id.clone());
-        } else {
-            assigned.insert(header.composer_id.clone(), hits);
-        }
-    }
-    Ok(SplitSuggestion {
-        assigned,
-        unassigned,
-        titles: headers
-            .iter()
-            .map(|header| (header.composer_id.clone(), header.title.clone()))
-            .collect(),
-    })
-}
-
-#[derive(Debug, Clone)]
-pub struct SplitSuggestion {
-    pub assigned: BTreeMap<String, Vec<PathBuf>>,
-    pub unassigned: Vec<String>,
-    pub titles: HashMap<String, Option<String>>,
-}
-
-pub fn split_workspace(
-    rt: &Runtime,
-    source_id: &str,
-    targets: &[PathBuf],
-    assignments: &BTreeMap<String, Vec<PathBuf>>,
-    move_chats: bool,
-) -> Result<Report> {
-    rt.check()?;
-    let source = require_workspace(rt, source_id)?;
-    let suggestion = suggest_split(rt, &source, targets)?;
-    for id in &suggestion.unassigned {
-        if !assignments.contains_key(id) {
-            bail!("unassigned chats need a target before split can continue: {id}");
-        }
-    }
-    let mut report = Report::default();
-    if rt.dry_run {
-        report.applied.push(format!("dry-run split {}", source.id));
-        return Ok(report);
-    }
-    rt.check()?;
-    let conn = open_global(rt)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut moved_ids = HashSet::new();
-    for target in targets {
-        let target = abs_path(target);
-        let workspace = ensure_folder_workspace(rt, &target)?;
-        let chats: Vec<String> = assignments
-            .iter()
-            .filter(|(_, dests)| dests.iter().any(|dest| abs_path(dest) == target))
-            .map(|(id, _)| id.clone())
-            .collect();
-        transfer_chats(
-            rt,
-            &tx,
-            &source,
-            &workspace,
-            &chats,
-            if move_chats {
-                Transfer::Move
-            } else {
-                Transfer::Copy
-            },
-            &mut TransferBook {
-                already: &mut moved_ids,
-                report: &mut report,
-            },
-        )?;
-    }
-    tx.commit()?;
-    report.applied.push(source.id.clone());
-    Ok(report)
-}
-
-pub fn combine_workspaces(
-    rt: &Runtime,
-    target: &Path,
-    sources: &[String],
-    move_chats: bool,
-) -> Result<Report> {
-    rt.check()?;
-    let target_path = abs_path(target);
-    if !target_path.exists()
-        && discover(rt)?
-            .iter()
-            .all(|ws| ws.id != target.to_string_lossy())
-    {
-        bail!("combine target does not exist: {}", target_path.display());
-    }
-    let target_ws = if let Some(existing) = find_workspace(rt, &target.to_string_lossy())? {
-        existing
-    } else {
-        ensure_folder_workspace(rt, &target_path)?
-    };
-    let mut report = Report::default();
-    if rt.dry_run {
-        report
-            .applied
-            .push(format!("dry-run combine {}", target_ws.id));
-        return Ok(report);
-    }
-    rt.check()?;
-    let conn = open_global(rt)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut moved_ids = HashSet::new();
-    for source_id in sources {
-        if let Some(source) = find_workspace(rt, source_id)? {
-            let ids = db::composer_ids_for_workspace(&tx, &source.id)?;
-            let tops = top_level_ids(&tx, &ids)?;
-            transfer_chats(
-                rt,
-                &tx,
-                &source,
-                &target_ws,
-                &tops,
-                if move_chats {
-                    Transfer::Move
-                } else {
-                    Transfer::Copy
-                },
-                &mut TransferBook {
-                    already: &mut moved_ids,
-                    report: &mut report,
-                },
-            )?;
-        } else {
-            transfer_chats(
-                rt,
-                &tx,
-                &target_ws,
-                &target_ws,
-                std::slice::from_ref(source_id),
-                if move_chats {
-                    Transfer::Move
-                } else {
-                    Transfer::Copy
-                },
-                &mut TransferBook {
-                    already: &mut moved_ids,
-                    report: &mut report,
-                },
-            )?;
-        }
-    }
-    tx.commit()?;
-    report.applied.push(target_ws.id);
-    Ok(report)
-}
-
-fn top_level_ids(conn: &Connection, ids: &[String]) -> Result<Vec<String>> {
-    let expanded = db::expand_chat_ids(conn, ids)?;
-    let set: HashSet<String> = expanded.iter().cloned().collect();
-    let mut children = HashSet::new();
-    for id in &expanded {
-        if let Some(raw) = db::read_text(conn, &format!("composerData:{id}"))?
-            && let Ok(json) = serde_json::from_str::<Value>(&raw)
-        {
-            for field in ["subComposerIds", "subagentComposerIds"] {
-                if let Some(items) = json.get(field).and_then(|v| v.as_array()) {
-                    for item in items {
-                        if let Some(child) = item.as_str()
-                            && set.contains(child)
-                        {
-                            children.insert(child.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(ids
-        .iter()
-        .filter(|id| !children.contains(*id))
-        .cloned()
-        .collect())
-}
-
-struct TransferBook<'a> {
-    already: &'a mut HashSet<String>,
-    report: &'a mut Report,
-}
-
-fn transfer_chats(
-    rt: &Runtime,
-    conn: &Connection,
-    source: &Workspace,
-    target: &Workspace,
-    chat_ids: &[String],
-    mode: Transfer,
-    book: &mut TransferBook<'_>,
-) -> Result<()> {
-    rt.check()?;
-    let owned = db::owned_ids(conn, &target.id)?;
-    let mut seeds = Vec::new();
-    for id in chat_ids {
-        if book.already.contains(id) && mode == Transfer::Move {
-            let replacements = identifier_replacements(source, target)?;
-            let expanded = db::expand_chat_ids(conn, std::slice::from_ref(id))?;
-            db::clone_chats(conn, &expanded, &target.id, &replacements)?;
-            book.report
-                .applied
-                .push(format!("copied extra {id} -> {}", target.id));
-            continue;
-        }
-        if owned.contains(id) {
-            book.report
-                .warnings
-                .push(format!("skipped {id}: already owned by {}", target.id));
-            book.report.skipped.push(id.clone());
-            continue;
-        }
-        seeds.push(id.clone());
-    }
-    if seeds.is_empty() {
-        return Ok(());
-    }
-    let expanded = db::expand_chat_ids(conn, &seeds)?;
-    let replacements = identifier_replacements(source, target)?;
-    match mode {
-        Transfer::Move => {
-            db::reassign_chats(conn, &expanded, &source.id, &target.id, &replacements)?;
-            shift_local_ids(rt, source, target, &expanded, &HashMap::new(), true)?;
-            move_transcripts(rt, source, target, &expanded, &HashMap::new(), true)?;
-            for id in &expanded {
-                book.already.insert(id.clone());
-            }
-        }
-        Transfer::Copy => {
-            let map = db::clone_chats(conn, &expanded, &target.id, &replacements)?;
-            shift_local_ids(rt, source, target, &expanded, &map, false)?;
-            move_transcripts(rt, source, target, &expanded, &map, false)?;
-            book.report
-                .warnings
-                .push("copied chats continue from local state only".to_string());
-        }
-    }
-    Ok(())
-}
-
-fn identifier_replacements(source: &Workspace, target: &Workspace) -> Result<Vec<Replacement>> {
-    let mut reps = vec![Replacement::new(&source.id, &target.id)];
-    if let (Some(old), Some(new)) = (&source.uri, &target.uri) {
-        reps.push(Replacement::new(old, new));
-    }
-    if let (Some(old), Some(new)) = (&source.path, &target.path) {
-        reps.push(Replacement::new(
-            old.to_string_lossy(),
-            new.to_string_lossy(),
-        ));
-    }
-    Ok(reps)
-}
-
-pub fn reindex(rt: &Runtime, target: &str) -> Result<Report> {
-    rt.check()?;
-    let workspace = require_workspace(rt, target)?;
-    let mut report = Report::default();
-    if rt.dry_run {
-        report
-            .applied
-            .push(format!("dry-run reindex {}", workspace.id));
-        return Ok(report);
-    }
-    rt.check()?;
-    let conn = open_global(rt)?;
-    let replacements = Vec::new();
-    db::rewrite_workspace(
-        &conn,
-        &workspace.id,
-        &replacements,
-        &workspace.id,
-        &workspace.id,
-        false,
-    )?;
-    clear_workspace_caches(&workspace.dir)?;
-    report.applied.push(workspace.id);
-    Ok(report)
-}
-
-pub fn remove_targets(rt: &Runtime, targets: &[String]) -> Result<Report> {
-    rt.check()?;
-    let mut report = Report::default();
-    if targets.is_empty() {
-        bail!("nothing selected to remove");
-    }
-    if rt.dry_run {
-        report.applied.push("dry-run remove".to_string());
-        return Ok(report);
-    }
-    rt.check()?;
-    let conn = open_global(rt)?;
-    for target in targets {
-        if let Some(workspace) = find_workspace(rt, target)? {
-            let ids = db::composer_ids_for_workspace(&conn, &workspace.id)?;
-            let expanded = db::expand_chat_ids(&conn, &ids)?;
-            db::delete_chats(&conn, &expanded)?;
-            if workspace.dir.exists() {
-                fs::remove_dir_all(&workspace.dir)?;
-            }
-            report.applied.push(workspace.id);
-        } else {
-            let expanded = db::expand_chat_ids(&conn, std::slice::from_ref(target))?;
-            db::delete_chats(&conn, &expanded)?;
-            report.applied.push(target.clone());
-        }
-    }
-    Ok(report)
 }
 
 pub fn list_workspaces(rt: &Runtime, unsaved_only: bool, detail: Option<&str>) -> Result<String> {
@@ -537,50 +248,16 @@ pub fn list_workspaces(rt: &Runtime, unsaved_only: bool, detail: Option<&str>) -
         workspaces.retain(|workspace| workspace.kind == Kind::Unsaved);
     }
     if let Some(id) = detail {
+        let wanted = normalize_path(Path::new(id));
         let workspace = workspaces
             .into_iter()
             .find(|workspace| {
-                workspace.id == id
-                    || workspace
-                        .path
-                        .as_ref()
-                        .is_some_and(|path| path.to_string_lossy() == id)
+                workspace.id == id || workspace.path.as_ref().is_some_and(|path| path == &wanted)
             })
             .with_context(|| format!("no workspace matches {id}"))?;
         return detail_table(rt, &workspace);
     }
     summary_table(rt, &workspaces)
-}
-
-pub fn export_workspace(rt: &Runtime, target: &str, file: &Path) -> Result<Report> {
-    rt.check()?;
-    let workspace = require_workspace(rt, target)?;
-    let mut report = Report::default();
-    if rt.dry_run {
-        report
-            .applied
-            .push(format!("dry-run export {}", file.display()));
-        return Ok(report);
-    }
-    rt.check()?;
-    archive::write_export(rt, &workspace, file)?;
-    report.applied.push(file.display().to_string());
-    Ok(report)
-}
-
-pub fn import_archive(rt: &Runtime, file: &Path, dest: Option<&Path>) -> Result<Report> {
-    rt.check()?;
-    let mut report = Report::default();
-    if rt.dry_run {
-        report
-            .applied
-            .push(format!("dry-run import {}", file.display()));
-        return Ok(report);
-    }
-    rt.check()?;
-    archive::read_import(rt, file, dest)?;
-    report.applied.push(file.display().to_string());
-    Ok(report)
 }
 
 pub fn show_history(rt: &Runtime) -> Result<String> {
@@ -602,715 +279,12 @@ pub fn record_history(
     outcome: &str,
     started: Instant,
 ) {
+    if rt.dry_run {
+        return;
+    }
     if let Err(err) = write_history(rt, command, args, outcome, started) {
         ui::warn(&format!("history was not written: {err}"));
     }
-}
-
-fn repath(
-    rt: &Runtime,
-    pairs: &[(String, String)],
-    replace: Option<(&str, &str)>,
-    regex: bool,
-    project: bool,
-    transfer: Transfer,
-) -> Result<Report> {
-    rt.check()?;
-    let mut report = Report::default();
-    let planned = preflight(rt, pairs, replace, regex, project, transfer, &mut report)?;
-    if planned.is_empty() {
-        return Ok(report);
-    }
-    if !report.warnings.is_empty() && !rt.yes && !rt.quiet {
-        bail!("warnings need confirmation; pass -y to continue");
-    }
-    if rt.dry_run {
-        for item in &planned {
-            report.applied.push(format!(
-                "dry-run {} -> {}",
-                item.source.id,
-                item.dest.display()
-            ));
-        }
-        return Ok(report);
-    }
-    apply_plans(rt, &planned, &mut report)?;
-    Ok(report)
-}
-
-fn preflight(
-    rt: &Runtime,
-    pairs: &[(String, String)],
-    replace: Option<(&str, &str)>,
-    regex: bool,
-    project: bool,
-    transfer: Transfer,
-    report: &mut Report,
-) -> Result<Vec<Planned>> {
-    let workspaces = discover(rt)?;
-    let mut specs: Vec<(Workspace, PathBuf)> = Vec::new();
-    if let Some((from, to)) = replace {
-        let pattern = if regex {
-            Some(Regex::new(from).with_context(|| format!("invalid regex: {from}"))?)
-        } else {
-            None
-        };
-        for workspace in workspaces {
-            if rt
-                .profile
-                .as_ref()
-                .is_some_and(|name| &workspace.profile != name)
-            {
-                continue;
-            }
-            let Some(path) = workspace.path.clone() else {
-                continue;
-            };
-            let path_str = path.to_string_lossy().to_string();
-            let updated = if let Some(pattern) = &pattern {
-                if !pattern.is_match(&path_str) {
-                    continue;
-                }
-                pattern.replace(&path_str, to).into_owned()
-            } else if path_str.contains(from) {
-                path_str.replacen(from, to, 1)
-            } else {
-                continue;
-            };
-            let dest = PathBuf::from(updated);
-            if project
-                && let Some(parent) = dest.parent()
-                && !parent.exists()
-            {
-                bail!(
-                    "--project refused: destination parent is missing: {}",
-                    parent.display()
-                );
-            }
-            if !project && !dest.exists() {
-                report.warnings.push(format!(
-                    "skipped {}: destination missing {}",
-                    workspace.id,
-                    dest.display()
-                ));
-                report.skipped.push(workspace.id.clone());
-                continue;
-            }
-            specs.push((workspace, dest));
-        }
-    } else {
-        for (from, to) in pairs {
-            let source = require_workspace(rt, from)?;
-            let dest = PathBuf::from(to);
-            if project {
-                if let Some(parent) = dest.parent()
-                    && !parent.as_os_str().is_empty()
-                    && !parent.exists()
-                {
-                    bail!(
-                        "--project refused: destination parent is missing: {}",
-                        parent.display()
-                    );
-                }
-            } else if !dest.exists() {
-                report.warnings.push(format!(
-                    "skipped {}: destination missing {}",
-                    source.id,
-                    dest.display()
-                ));
-                report.skipped.push(source.id);
-                continue;
-            }
-            specs.push((source, abs_path(&dest)));
-        }
-    }
-    let mut planned = Vec::new();
-    for (source, dest) in specs {
-        let item = plan_one(&source, &dest, project, transfer)?;
-        let dest_dir = rt.layout.workspace_storage().join(&item.new_hash);
-        if dest_dir.exists() && dest_dir != source.dir {
-            bail!(
-                "collision: {} already holds another workspace; refusing overwrite",
-                dest_dir.display()
-            );
-        }
-        planned.push(item);
-    }
-    if transfer == Transfer::Copy {
-        for item in &planned {
-            let needed = dir_size(&item.source.dir).unwrap_or(0);
-            if let Some(free) = free_bytes(&item.dest)
-                && free < needed
-            {
-                bail!(
-                    "not enough disk space to copy {}: need {needed} bytes, {free} free",
-                    item.source.id
-                );
-            }
-        }
-    }
-    Ok(planned)
-}
-
-#[cfg(unix)]
-fn free_bytes(path: &Path) -> Option<u64> {
-    let text = path.to_string_lossy();
-    let c_path = std::ffi::CString::new(text.as_bytes()).ok()?;
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-            return None;
-        }
-        Some(u64::from(stat.f_bavail).saturating_mul(stat.f_frsize))
-    }
-}
-
-#[cfg(windows)]
-fn free_bytes(path: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-    // GetDiskFreeSpaceExW only accepts directories; `.code-workspace` destinations are files.
-    let dir = if path.is_file() { path.parent()? } else { path };
-    let wide: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut available = 0u64;
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut available,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    (ok != 0).then_some(available)
-}
-
-fn plan_one(source: &Workspace, dest: &Path, project: bool, transfer: Transfer) -> Result<Planned> {
-    let dest = if project {
-        dest.to_path_buf()
-    } else {
-        abs_path(dest)
-    };
-    if !project && !dest.exists() {
-        bail!("destination does not exist: {}", dest.display());
-    }
-    let hash_path = if project && !dest.exists() {
-        source
-            .path
-            .clone()
-            .context("project move needs a source path")?
-    } else {
-        dest.clone()
-    };
-    let new_hash = if project && !dest.exists() {
-        "pending".to_string()
-    } else {
-        compute_workspace_hash(&hash_path)?
-    };
-    let dest_uri = file_uri(&dest)?;
-    Ok(Planned {
-        source: source.clone(),
-        dest,
-        dest_uri,
-        new_hash,
-        project,
-        transfer,
-    })
-}
-
-fn apply_plans(rt: &Runtime, planned: &[Planned], report: &mut Report) -> Result<()> {
-    let backup = backup_plans(rt, planned)?;
-    let progress = DualProgress::new(planned.len() as u64, rt.quiet);
-    for (index, item) in planned.iter().enumerate() {
-        rt.check().inspect_err(|_| {
-            restore_backup(&backup).ok();
-        })?;
-        progress.step(
-            index as u64,
-            &format!("{} {}", item.source.id, item.dest.display()),
-        );
-        let applied = apply_one(rt, item, report, &progress).inspect_err(|_| {
-            restore_backup(&backup).ok();
-        })?;
-        verify_plan(rt, &applied)?;
-        report
-            .applied
-            .push(format!("{} -> {}", applied.source.id, applied.new_hash));
-    }
-    progress.finish();
-    Ok(())
-}
-
-fn apply_one(
-    rt: &Runtime,
-    item: &Planned,
-    report: &mut Report,
-    progress: &DualProgress,
-) -> Result<Planned> {
-    let mut item = item.clone();
-    rt.check()?;
-    if item.project {
-        shift_project_dir(&item)?;
-        item.new_hash = compute_workspace_hash(&item.dest)?;
-        item.dest_uri = file_uri(&item.dest)?;
-    }
-    rt.check()?;
-    relocate_storage(rt, &item)?;
-    rt.check()?;
-    rewrite_global(rt, &item, progress)?;
-    rt.check()?;
-    let keys = rewrite_storage_json(rt.layout.storage_json(), &plan_replacements(&item)?, false)?;
-    report.rewritten_keys.extend(keys);
-    rt.check()?;
-    relocate_projects(rt, &item)?;
-    Ok(item)
-}
-
-fn plan_replacements(item: &Planned) -> Result<Vec<Replacement>> {
-    let mut reps = vec![
-        Replacement::new(&item.source.id, &item.new_hash),
-        Replacement::new(&item.dest_uri, &item.dest_uri),
-    ];
-    if let Some(old_uri) = &item.source.uri {
-        reps.push(Replacement::new(old_uri, &item.dest_uri));
-    }
-    if let Some(old_path) = &item.source.path {
-        reps.push(Replacement::new(
-            old_path.to_string_lossy().as_ref(),
-            item.dest.to_string_lossy().as_ref(),
-        ));
-    }
-    Ok(reps)
-}
-
-fn shift_project_dir(item: &Planned) -> Result<()> {
-    let Some(source) = &item.source.path else {
-        bail!("--project needs a real source folder");
-    };
-    if item.dest.exists() {
-        bail!(
-            "collision: destination already exists: {}",
-            item.dest.display()
-        );
-    }
-    match item.transfer {
-        Transfer::Move => {
-            fs::rename(source, &item.dest).with_context(|| {
-                format!(
-                    "failed to move {} to {}",
-                    source.display(),
-                    item.dest.display()
-                )
-            })?;
-        }
-        Transfer::Copy => {
-            let options = CopyOptions::new().copy_inside(true);
-            dir::copy(source, &item.dest, &options)?;
-        }
-    }
-    Ok(())
-}
-
-fn relocate_storage(rt: &Runtime, item: &Planned) -> Result<()> {
-    let dest_dir = rt.layout.workspace_storage().join(&item.new_hash);
-    if item.source.dir == dest_dir {
-        write_workspace_json(&dest_dir, &item.dest_uri, &item.dest)?;
-        return Ok(());
-    }
-    if dest_dir.exists() {
-        bail!(
-            "collision: {} already holds another workspace; refusing overwrite",
-            dest_dir.display()
-        );
-    }
-    fs::create_dir_all(rt.layout.workspace_storage())?;
-    match item.transfer {
-        Transfer::Move => {
-            fs::rename(&item.source.dir, &dest_dir)?;
-        }
-        Transfer::Copy => {
-            let options = CopyOptions::new().copy_inside(true);
-            dir::copy(&item.source.dir, &dest_dir, &options)?;
-        }
-    }
-    write_workspace_json(&dest_dir, &item.dest_uri, &item.dest)?;
-    Ok(())
-}
-
-fn write_workspace_json(dir: &Path, uri: &str, path: &Path) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let body = if path.extension().and_then(|ext| ext.to_str()) == Some("code-workspace") {
-        json!({ "workspace": uri })
-    } else {
-        json!({ "folder": uri })
-    };
-    fs::write(
-        dir.join("workspace.json"),
-        serde_json::to_string_pretty(&body)?,
-    )?;
-    Ok(())
-}
-
-fn rewrite_global(rt: &Runtime, item: &Planned, progress: &DualProgress) -> Result<()> {
-    let path = rt.layout.global_db();
-    if !path.exists() {
-        return Ok(());
-    }
-    let conn = db::open_rw(&path)?;
-    let replacements = plan_replacements(item)?;
-    let count = if item.transfer == Transfer::Copy {
-        let ids = db::composer_ids_for_workspace(&conn, &item.source.id)?;
-        db::clone_chats(&conn, &ids, &item.new_hash, &replacements)?.len()
-    } else {
-        db::rewrite_workspace(
-            &conn,
-            &item.source.id,
-            &replacements,
-            &item.source.id,
-            &item.new_hash,
-            false,
-        )?
-    };
-    progress.rows(count as u64, count as u64, "rows");
-    Ok(())
-}
-
-fn relocate_projects(rt: &Runtime, item: &Planned) -> Result<()> {
-    let Some(old_path) = &item.source.path else {
-        return Ok(());
-    };
-    let old_slug = path_to_folder_id(old_path);
-    let new_slug = path_to_folder_id(&item.dest);
-    let source = rt.layout.projects_dir.join(&old_slug);
-    let dest = rt.layout.projects_dir.join(&new_slug);
-    if !source.exists() || old_slug == new_slug {
-        return Ok(());
-    }
-    fs::create_dir_all(&rt.layout.projects_dir)?;
-    match item.transfer {
-        Transfer::Move => {
-            if dest.exists() {
-                bail!("collision: project slug already exists: {}", dest.display());
-            }
-            fs::rename(&source, &dest)?;
-        }
-        Transfer::Copy => {
-            let options = CopyOptions::new().copy_inside(true);
-            dir::copy(&source, &dest, &options)?;
-        }
-    }
-    Ok(())
-}
-
-fn verify_plan(rt: &Runtime, item: &Planned) -> Result<()> {
-    let dir = rt.layout.workspace_storage().join(&item.new_hash);
-    let raw = fs::read_to_string(dir.join("workspace.json"))
-        .with_context(|| format!("missing workspace.json in {}", dir.display()))?;
-    let json: Value = serde_json::from_str(&raw)?;
-    let uri = json
-        .get("folder")
-        .or_else(|| json.get("workspace"))
-        .and_then(|v| v.as_str())
-        .context("workspace.json has no folder or workspace uri")?;
-    if uri != item.dest_uri {
-        bail!("verify failed: workspace.json uri is {uri}");
-    }
-    if item.dest.exists() {
-        let hashed = compute_workspace_hash(&item.dest)?;
-        if hashed != item.new_hash && item.new_hash != "pending" {
-            bail!("verify failed: hash dir {} != {hashed}", item.new_hash);
-        }
-    }
-    if rt.layout.global_db().exists() {
-        let conn = db::open_rw(&rt.layout.global_db())?;
-        let count = db::count_headers(&conn, &item.new_hash)?;
-        if count == 0
-            && db::count_headers(&conn, &item.source.id)? > 0
-            && item.transfer == Transfer::Move
-        {
-            bail!(
-                "verify failed: composerHeaders were not moved to {}",
-                item.new_hash
-            );
-        }
-        if let Some(old) = &item.source.path {
-            let old = old.to_string_lossy().to_string();
-            if old != item.dest.to_string_lossy()
-                && db::row_contains_old(&conn, &item.new_hash, &old)?
-            {
-                bail!("verify failed: old path still present in touched rows");
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-struct SavedFile {
-    live: PathBuf,
-    copy: PathBuf,
-}
-
-#[derive(Clone)]
-struct WorkspaceBackup {
-    original: PathBuf,
-    copy: PathBuf,
-    relocated: Option<PathBuf>,
-}
-
-#[derive(Clone)]
-struct Backup {
-    storage_json: Option<SavedFile>,
-    global_db: Option<SavedFile>,
-    global_sidecars: Vec<SavedFile>,
-    workspaces: Vec<WorkspaceBackup>,
-}
-
-fn backup_plans(rt: &Runtime, planned: &[Planned]) -> Result<Backup> {
-    let dir = rt
-        .layout
-        .backup_root()
-        .join(Utc::now().timestamp_millis().to_string());
-    fs::create_dir_all(&dir)?;
-    let storage_json = copy_file(&rt.layout.storage_json(), &dir.join("storage.json"))?;
-    let global_db = copy_file(&rt.layout.global_db(), &dir.join("state.vscdb"))?;
-    let mut global_sidecars = Vec::new();
-    for sidecar in sqlite_sidecars(&rt.layout.global_db()) {
-        if let Some(saved) =
-            copy_file(&sidecar, &dir.join(sidecar.file_name().unwrap_or_default()))?
-        {
-            global_sidecars.push(saved);
-        }
-    }
-    let mut workspaces = Vec::new();
-    for item in planned {
-        if item.source.dir.exists() {
-            let dest = dir.join("workspace").join(&item.source.id);
-            let options = CopyOptions::new().copy_inside(true);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            dir::copy(&item.source.dir, &dest, &options)?;
-            let relocated = rt.layout.workspace_storage().join(&item.new_hash);
-            let relocated = if item.new_hash != item.source.id && item.new_hash != "pending" {
-                Some(relocated)
-            } else {
-                None
-            };
-            workspaces.push(WorkspaceBackup {
-                original: item.source.dir.clone(),
-                copy: dest,
-                relocated,
-            });
-        }
-    }
-    Ok(Backup {
-        storage_json,
-        global_db,
-        global_sidecars,
-        workspaces,
-    })
-}
-
-fn copy_file(live: &Path, copy: &Path) -> Result<Option<SavedFile>> {
-    if !live.exists() {
-        return Ok(None);
-    }
-    if let Some(parent) = copy.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(live, copy)?;
-    Ok(Some(SavedFile {
-        live: live.to_path_buf(),
-        copy: copy.to_path_buf(),
-    }))
-}
-
-fn sqlite_sidecars(db: &Path) -> Vec<PathBuf> {
-    ["-wal", "-shm", "-journal"]
-        .into_iter()
-        .map(|suffix| {
-            let mut name = db.file_name().unwrap_or_default().to_os_string();
-            name.push(suffix);
-            db.with_file_name(name)
-        })
-        .collect()
-}
-
-fn restore_saved(file: &SavedFile) -> Result<()> {
-    if let Some(parent) = file.live.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(&file.copy, &file.live)?;
-    Ok(())
-}
-
-fn restore_dir(copy: &Path, original: &Path) -> Result<()> {
-    if original.exists() {
-        fs::remove_dir_all(original)?;
-    }
-    if let Some(parent) = original.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let options = CopyOptions::new().copy_inside(true);
-    dir::copy(copy, original, &options)?;
-    Ok(())
-}
-
-fn restore_backup(backup: &Backup) -> Result<()> {
-    if let Some(file) = &backup.storage_json {
-        restore_saved(file)?;
-    }
-    if let Some(file) = &backup.global_db {
-        restore_saved(file)?;
-        for sidecar in sqlite_sidecars(&file.live) {
-            if sidecar.exists() {
-                fs::remove_file(&sidecar)?;
-            }
-        }
-        for sidecar in &backup.global_sidecars {
-            restore_saved(sidecar)?;
-        }
-    }
-    for workspace in &backup.workspaces {
-        if let Some(relocated) = &workspace.relocated
-            && relocated != &workspace.original
-            && relocated.exists()
-        {
-            fs::remove_dir_all(relocated)?;
-        }
-        if workspace.copy.exists() {
-            restore_dir(&workspace.copy, &workspace.original)?;
-        }
-    }
-    Ok(())
-}
-
-fn shift_local_ids(
-    rt: &Runtime,
-    source: &Workspace,
-    target: &Workspace,
-    ids: &[String],
-    map: &HashMap<String, String>,
-    remove_source: bool,
-) -> Result<()> {
-    let source_db = source.dir.join("state.vscdb");
-    let target_dir = rt.layout.workspace_storage().join(&target.id);
-    let target_db = target_dir.join("state.vscdb");
-    if source_db.exists() && remove_source {
-        let conn = db::open_rw(&source_db)?;
-        registry::ensure_local_schema(&conn)?;
-        let (mut selected, mut focused) = db::local_selected(&conn)?;
-        selected.retain(|id| !ids.contains(id));
-        focused.retain(|id| !ids.contains(id));
-        db::write_local_selected(&conn, &selected, &focused)?;
-    }
-    fs::create_dir_all(&target_dir)?;
-    let conn = if target_db.exists() {
-        db::open_rw(&target_db)?
-    } else {
-        let conn = Connection::open(&target_db)?;
-        registry::ensure_local_schema(&conn)?;
-        conn
-    };
-    let (mut selected, mut focused) = db::local_selected(&conn)?;
-    for id in ids {
-        let stored = map.get(id).cloned().unwrap_or_else(|| id.clone());
-        if !selected.contains(&stored) {
-            selected.push(stored.clone());
-        }
-        if !focused.contains(&stored) {
-            focused.push(stored);
-        }
-    }
-    db::write_local_selected(&conn, &selected, &focused)?;
-    Ok(())
-}
-
-fn move_transcripts(
-    rt: &Runtime,
-    source: &Workspace,
-    target: &Workspace,
-    ids: &[String],
-    map: &HashMap<String, String>,
-    remove_source: bool,
-) -> Result<()> {
-    let Some(source_path) = &source.path else {
-        return Ok(());
-    };
-    let Some(target_path) = &target.path else {
-        return Ok(());
-    };
-    let source_root = rt
-        .layout
-        .projects_dir
-        .join(path_to_folder_id(source_path))
-        .join("agent-transcripts");
-    let target_root = rt
-        .layout
-        .projects_dir
-        .join(path_to_folder_id(target_path))
-        .join("agent-transcripts");
-    if !source_root.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(&target_root)?;
-    for id in ids {
-        let from = source_root.join(id);
-        if !from.exists() {
-            continue;
-        }
-        let dest_id = map.get(id).cloned().unwrap_or_else(|| id.clone());
-        let dest = target_root.join(dest_id);
-        match (remove_source, map.is_empty()) {
-            (true, true) => {
-                fs::rename(&from, &dest)?;
-            }
-            _ => {
-                let options = CopyOptions::new().copy_inside(true);
-                dir::copy(&from, &dest, &options)?;
-                if remove_source {
-                    fs::remove_dir_all(&from).ok();
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_folder_workspace(rt: &Runtime, path: &Path) -> Result<Workspace> {
-    if let Some(existing) = discover(rt)?
-        .into_iter()
-        .find(|workspace| workspace.path.as_ref().is_some_and(|found| found == path))
-    {
-        return Ok(existing);
-    }
-    let hash = compute_workspace_hash(path)?;
-    let dir = rt.layout.workspace_storage().join(&hash);
-    if dir.exists() {
-        bail!(
-            "collision: {} already holds another workspace; refusing overwrite",
-            dir.display()
-        );
-    }
-    let uri = file_uri(path)?;
-    write_workspace_json(&dir, &uri, path)?;
-    let db_path = dir.join("state.vscdb");
-    let conn = Connection::open(&db_path)?;
-    registry::ensure_local_schema(&conn)?;
-    Ok(Workspace {
-        id: hash,
-        dir,
-        kind: Kind::Folder,
-        uri: Some(uri),
-        path: Some(path.to_path_buf()),
-        profile: "default".to_string(),
-        destination_missing: false,
-    })
 }
 
 pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
@@ -1318,6 +292,7 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
     let root = rt.layout.workspace_storage();
     if root.exists() {
         let profiles = profile_map(rt)?;
+        let unsaved_root = normalize_path(&rt.layout.unsaved_root());
         for entry in fs::read_dir(&root)?.flatten() {
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -1325,8 +300,12 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
             let dir = entry.path();
             let id = entry.file_name().to_string_lossy().to_string();
             let uri = workspace::read_workspace_target_uri(&dir)?;
-            let path = uri.as_deref().and_then(uri_to_path);
-            let kind = classify(&id, uri.as_deref(), path.as_deref());
+            let path = uri.as_deref().and_then(|uri| {
+                uri::parse_file_uri(Platform::current(), uri)
+                    .map(|path| normalize_path(Path::new(&path)))
+                    .or_else(|| uri_path(uri))
+            });
+            let kind = classify(&dir, uri.as_deref(), path.as_deref(), &unsaved_root);
             let profile = uri
                 .as_ref()
                 .and_then(|value| profiles.get(value).cloned())
@@ -1335,7 +314,7 @@ pub fn discover(rt: &Runtime) -> Result<Vec<Workspace>> {
                 Kind::Folder | Kind::CodeWorkspace => {
                     path.as_ref().is_none_or(|path| !path.exists())
                 }
-                Kind::Unsaved | Kind::EmptyWindow => false,
+                Kind::Unsaved | Kind::EmptyWindow | Kind::Remote => false,
             };
             found.push(Workspace {
                 id,
@@ -1377,44 +356,54 @@ fn profile_map(rt: &Runtime) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
-fn classify(id: &str, uri: Option<&str>, path: Option<&Path>) -> Kind {
-    if id == "empty-window" {
+fn classify(dir: &Path, uri: Option<&str>, path: Option<&Path>, unsaved_root: &Path) -> Kind {
+    let Some(uri) = uri else {
         return Kind::EmptyWindow;
-    }
-    if let Some(uri) = uri
-        && (uri.contains("/Workspaces/") || id.chars().all(|ch| ch.is_ascii_digit()))
+    };
+    if !uri
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
     {
-        return Kind::Unsaved;
+        return Kind::Remote;
     }
-    if path
-        .is_some_and(|path| path.extension().and_then(|ext| ext.to_str()) == Some("code-workspace"))
-    {
+    let Some(path) = path else {
+        return Kind::EmptyWindow;
+    };
+    let is_workspace_key = fs::read_to_string(dir.join("workspace.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|json| json.get("folder").is_none() && json.get("workspace").is_some());
+    if is_workspace_key || is_workspace_file(path) {
+        if path.starts_with(unsaved_root) {
+            return Kind::Unsaved;
+        }
         return Kind::CodeWorkspace;
-    }
-    if uri.is_none() && path.is_none() {
-        return Kind::EmptyWindow;
     }
     Kind::Folder
 }
 
 fn is_unsaved_id(workspace: &Workspace, id: &str) -> bool {
-    if workspace.id == id {
-        return workspace.kind == Kind::Unsaved
-            || workspace.id.chars().all(|ch| ch.is_ascii_digit());
+    if workspace.kind != Kind::Unsaved {
+        return false;
     }
-    workspace.uri.as_ref().is_some_and(|uri| {
-        uri.contains(&format!("/Workspaces/{id}/")) || uri.contains(&format!("/Workspaces/{id}"))
+    if workspace.id == id {
+        return true;
+    }
+    workspace.path.as_ref().is_some_and(|path| {
+        path.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.to_string_lossy() == id)
     })
 }
 
 pub fn find_workspace(rt: &Runtime, id: &str) -> Result<Option<Workspace>> {
-    let path = PathBuf::from(id);
+    let wanted = normalize_path(Path::new(id));
     Ok(discover(rt)?.into_iter().find(|workspace| {
         workspace.id == id
             || workspace
                 .path
                 .as_ref()
-                .is_some_and(|found| found == &path || found.to_string_lossy() == id)
+                .is_some_and(|found| found == &wanted)
             || is_unsaved_id(workspace, id)
     }))
 }
@@ -1424,16 +413,17 @@ fn require_workspace(rt: &Runtime, id: &str) -> Result<Workspace> {
         .and_then(|found| found.with_context(|| format!("no workspace matches {id}")))
 }
 
-fn open_global(rt: &Runtime) -> Result<Connection> {
-    db::ensure_db(&rt.layout.global_db())
+/// Read-only global database, or `None` when Cursor has not created one.
+fn open_global_ro(rt: &Runtime) -> Result<Option<Connection>> {
+    let path = rt.layout.global_db();
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(sql::open_ro(&path)?))
 }
 
 fn summary_table(rt: &Runtime, workspaces: &[Workspace]) -> Result<String> {
-    let conn = if rt.layout.global_db().exists() {
-        Some(db::open_rw(&rt.layout.global_db())?)
-    } else {
-        None
-    };
+    let conn = open_global_ro(rt)?;
     let mut table = ui::table(&[
         "profile",
         "kind",
@@ -1449,7 +439,7 @@ fn summary_table(rt: &Runtime, workspaces: &[Workspace]) -> Result<String> {
             Some(conn) => header_counts(conn, &workspace.id)?,
             None => (0, 0),
         };
-        let size = dir_size(&workspace.dir).unwrap_or(0);
+        let size = fsops::dir_size(&workspace.dir).unwrap_or(0);
         table.add_row([
             workspace.profile.clone(),
             workspace.kind.label().to_string(),
@@ -1476,8 +466,7 @@ fn summary_table(rt: &Runtime, workspaces: &[Workspace]) -> Result<String> {
 fn detail_table(rt: &Runtime, workspace: &Workspace) -> Result<String> {
     let mut lines = summary_table(rt, std::slice::from_ref(workspace))?;
     lines.push('\n');
-    if rt.layout.global_db().exists() {
-        let conn = db::open_rw(&rt.layout.global_db())?;
+    if let Some(conn) = open_global_ro(rt)? {
         let headers = db::headers(&conn, &workspace.id)?;
         let mut table = ui::table(&["chat", "title", "subagent", "archived", "updated"]);
         for header in headers {
@@ -1506,30 +495,6 @@ fn yes_no(value: bool) -> String {
     } else {
         "no".to_string()
     }
-}
-
-fn dir_size(path: &Path) -> Result<u64> {
-    let mut total = 0u64;
-    if !path.exists() {
-        return Ok(0);
-    }
-    for entry in walkdir::WalkDir::new(path) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
-}
-
-fn clear_workspace_caches(dir: &Path) -> Result<()> {
-    for name in ["Cache", "CachedData", "GPUCache", "Code Cache"] {
-        let path = dir.join(name);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
-        }
-    }
-    Ok(())
 }
 
 fn write_history(
@@ -1573,29 +538,15 @@ fn write_history(
     Ok(())
 }
 
-fn file_uri(path: &Path) -> Result<String> {
-    Url::from_file_path(path)
-        .map(|url| url.to_string())
-        .map_err(|_| anyhow::anyhow!("failed to convert path to uri: {}", path.display()))
-}
-
-fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let url = Url::parse(uri).ok()?;
-    match url.scheme() {
-        "file" => url.to_file_path().ok(),
-        _ => Some(PathBuf::from(url.path())),
-    }
-}
-
 fn materialize_path(raw: &str) -> Option<PathBuf> {
-    if let Some(path) = uri_to_path(raw) {
-        return Some(path);
+    if raw.contains("://") {
+        return uri_path(raw);
     }
     let decoded = percent_encoding::percent_decode_str(raw)
         .decode_utf8()
         .ok()?;
     if decoded.starts_with('/') || decoded.contains(":\\") {
-        Some(PathBuf::from(decoded.as_ref()))
+        Some(normalize_path(Path::new(decoded.as_ref())))
     } else {
         None
     }
@@ -1607,16 +558,6 @@ fn longest_target(path: &Path, targets: &[PathBuf]) -> Option<PathBuf> {
         .filter(|target| path.starts_with(target))
         .max_by_key(|target| target.as_os_str().len())
         .cloned()
-}
-
-fn abs_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
 }
 
 fn cursor_process_running() -> bool {
@@ -1646,9 +587,6 @@ fn cursor_process_running() -> bool {
     }
 }
 
-mod archive;
-mod stats;
-
 pub fn profiles_from_storage(json: &Value) -> Vec<String> {
     let mut names = vec!["default".to_string()];
     if let Some(items) = json.get("userDataProfiles").and_then(|v| v.as_array()) {
@@ -1663,32 +601,4 @@ pub fn profiles_from_storage(json: &Value) -> Vec<String> {
 
 pub fn load_registry(conn: &Connection) -> Result<Vec<ComposerHeader>> {
     registry::load_headers(conn)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn free_bytes_reports_space_for_directory() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert!(free_bytes(dir.path()).is_some_and(|free| free > 0));
-    }
-
-    #[test]
-    fn free_bytes_reports_space_for_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("project.code-workspace");
-        fs::write(&file, "{}").unwrap();
-
-        assert!(free_bytes(&file).is_some_and(|free| free > 0));
-    }
-
-    #[test]
-    fn free_bytes_is_none_for_missing_path() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert_eq!(free_bytes(&dir.path().join("missing").join("deeper")), None);
-    }
 }

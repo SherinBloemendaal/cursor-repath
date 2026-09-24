@@ -111,7 +111,7 @@ pub struct SplitArgs {
     pub source: Option<String>,
     pub targets: Vec<String>,
     /// Remove chats from the source after they land on the targets.
-    #[arg(long)]
+    #[arg(long = "move")]
     pub move_chats: bool,
 }
 
@@ -121,8 +121,11 @@ pub struct CombineArgs {
     pub common: CommonArgs,
     pub target: Option<String>,
     pub sources: Vec<String>,
+    /// Keep the chats in the sources (default).
+    #[arg(long, conflicts_with = "move_chats")]
+    pub copy: bool,
     /// Remove chats from the sources.
-    #[arg(long)]
+    #[arg(long = "move")]
     pub move_chats: bool,
 }
 
@@ -154,6 +157,9 @@ pub struct ImportArgs {
     pub common: CommonArgs,
     pub file: Option<String>,
     pub to: Option<String>,
+    /// Replace chats that already exist instead of skipping them.
+    #[arg(long)]
+    pub overwrite: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -219,7 +225,7 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 Some(target) => vec![target],
                 None => pick_many(rt, "Remove which workspaces?")?,
             };
-            if !ui::confirm("Remove the selected Cursor metadata?", rt.yes)? {
+            if !rt.dry_run && !ui::confirm("Remove the selected Cursor metadata?", rt.yes)? {
                 bail!("aborted");
             }
             let report = remove_targets(rt, &targets)?;
@@ -245,7 +251,7 @@ fn execute(rt: &Runtime, command: Command) -> Result<()> {
                 .or_else(|| ui::input("Archive path").ok().map(PathBuf::from))
                 .ok_or_else(|| anyhow::anyhow!("a file is required"))?;
             let dest = args.to.map(PathBuf::from);
-            let report = import_archive(rt, &file, dest.as_deref())?;
+            let report = import_archive(rt, &file, dest.as_deref(), args.overwrite)?;
             finish(report);
             Ok(())
         }

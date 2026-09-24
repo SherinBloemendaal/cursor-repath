@@ -28,13 +28,13 @@ powershell -c "irm https://raw.githubusercontent.com/SherinBloemendaal/cursor-re
 
 Published archives, checked against `SHA256SUMS` on the GitHub release:
 
-| Platform | Asset |
-| --- | --- |
-| macOS Apple Silicon | `crepath-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `crepath-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc) | `crepath-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc) | `crepath-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x64 | `crepath-x86_64-pc-windows-msvc.zip` |
+| Platform             | Asset                                      |
+| -------------------- | ------------------------------------------ |
+| macOS Apple Silicon  | `crepath-aarch64-apple-darwin.tar.gz`      |
+| macOS Intel          | `crepath-x86_64-apple-darwin.tar.gz`       |
+| Linux x86_64 (glibc) | `crepath-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux arm64 (glibc)  | `crepath-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64          | `crepath-x86_64-pc-windows-msvc.zip`       |
 
 <p align="center">
   <a href="https://github.com/SherinBloemendaal/cursor-repath/actions/workflows/ci.yml"><img src="https://github.com/SherinBloemendaal/cursor-repath/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -57,23 +57,23 @@ Close Cursor before any command that writes. `crepath` aborts if Cursor is runni
 
 Any command with no arguments opens the picker (space toggles, Enter once, then one validation screen). `crepath` with no command prints colored help. There is no `mg` command.
 
-| Command | What it does |
-| --- | --- |
-| `crepath mv [FROM] [TO]` | Repath workspace metadata. Alias: `move`. |
-| `crepath cp [FROM] [TO]` | Copy: new workspace identity, chats duplicated. Alias: `copy`. |
-| `crepath save [ID] [TO]` | Attach an unsaved `Workspaces/<ts>` session to a folder or `.code-workspace`. Metadata only. |
-| `crepath split [SOURCE] [TARGETS...]` | Copy chats from one workspace into separate projects. |
-| `crepath combine [TARGET] [SOURCES...]` | Pull chats from several workspaces or chats into one target. |
-| `crepath rx [TARGET]` | Rebuild registry refs, rewrite leftover path refs, clear caches. Alias: `reindex`. |
-| `crepath ls` | Table of workspaces. Alias: `list`. `ls <id>` shows the chat list. |
-| `crepath rm [TARGET]` | Remove workspace metadata, or one chat (including subagents). One confirmation. |
-| `crepath export [TARGET] [FILE]` | Write a `.crepath` gzip archive. |
-| `crepath import [FILE] [TO]` | Restore a `.crepath` archive. |
-| `crepath history` | Local log at `~/.crepath/history.jsonl`. Entries older than 30 days are pruned on write. |
-| `crepath stats` | Profiles, workspaces, chats, disk, tokens, models. |
-| `crepath help` | Colored help. |
-| `crepath update` | Download and install the latest release for this OS. |
-| `crepath github` | Open the GitHub repository in the browser. |
+| Command                                 | What it does                                                                                 |
+| --------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `crepath mv [FROM] [TO]`                | Repath workspace metadata. Alias: `move`.                                                    |
+| `crepath cp [FROM] [TO]`                | Copy: new workspace identity, chats duplicated. Alias: `copy`.                               |
+| `crepath save [ID] [TO]`                | Attach an unsaved `Workspaces/<ts>` session to a folder or `.code-workspace`. Metadata only. |
+| `crepath split [SOURCE] [TARGETS...]`   | Copy chats from one workspace into separate projects.                                        |
+| `crepath combine [TARGET] [SOURCES...]` | Pull chats from several workspaces or chats into one target.                                 |
+| `crepath rx [TARGET]`                   | Rebuild registry refs, rewrite leftover path refs, clear caches. Alias: `reindex`.           |
+| `crepath ls`                            | Table of workspaces. Alias: `list`. `ls <id>` shows the chat list.                           |
+| `crepath rm [TARGET]`                   | Remove workspace metadata, or one chat (including subagents). One confirmation.              |
+| `crepath export [TARGET] [FILE]`        | Write a `.crepath` gzip archive.                                                             |
+| `crepath import [FILE] [TO]`            | Restore a `.crepath` archive. `TO` attaches it to another folder.                            |
+| `crepath history`                       | Local log at `~/.crepath/history.jsonl`. Entries older than 30 days are pruned on write.     |
+| `crepath stats`                         | Profiles, workspaces, chats, disk, tokens, models.                                           |
+| `crepath help`                          | Colored help.                                                                                |
+| `crepath update`                        | Download and install the latest release for this OS.                                         |
+| `crepath github`                        | Open the GitHub repository in the browser.                                                   |
 
 `crepath update` checks `SHA256SUMS`, then replaces the binary in `$CREPATH_INSTALL` or `~/.crepath/bin`.
 
@@ -83,7 +83,9 @@ Any command with no arguments opens the picker (space toggles, Enter once, then 
 
 `split` copies by default. `--move` removes the chats from the source.
 
-`combine` copies by default (`--copy`). `--move` removes the chats from the sources. The target can be an existing workspace, or a real folder or `.code-workspace` path that `crepath` creates. Sources are whole workspaces or individual chats.
+`combine` copies by default (`--copy`). `--move` removes the chats from the sources. The target can be an existing workspace, or a real folder or `.code-workspace` path that `crepath` creates. Sources are whole workspaces or individual chat ids.
+
+`rx` rebuilds the chat registry from the workspace's `workspace.json`: it fixes stale `workspaceIdentifier` entries, adopts chats that still point at this path from a workspace id that no longer exists, rewrites their old paths, and clears caches.
 
 `ls` columns: profile, kind (folder, code-workspace, unsaved, empty-window), path, chats, subagents, size, hash, and a destination-missing flag. `--unsaved` limits the table to unsaved sessions.
 
@@ -91,14 +93,14 @@ A missing destination is a warning. That item is skipped.
 
 ### Shared flags
 
-| Flag | Effect |
-| --- | --- |
-| `-n` | Dry-run. Write nothing. |
-| `-y` | Skip the single warning prompt. |
-| `--profile NAME` | Limit the run to one Cursor profile. |
-| `--replace FROM TO` | Batch-rewrite a path prefix. |
-| `--regex` | Treat `--replace` FROM as a regular expression. |
-| `--unsaved` | Include or filter unsaved `Workspaces/<ts>` sessions. |
+| Flag                | Effect                                                |
+| ------------------- | ----------------------------------------------------- |
+| `-n`                | Dry-run. Show the plan and write nothing.             |
+| `-y`                | Skip the single warning prompt.                       |
+| `--profile NAME`    | Limit the run to one Cursor profile.                  |
+| `--replace FROM TO` | Batch-rewrite a path prefix.                          |
+| `--regex`           | Treat `--replace` FROM as a regular expression.       |
+| `--unsaved`         | Include or filter unsaved `Workspaces/<ts>` sessions. |
 
 ### Examples
 
@@ -119,21 +121,23 @@ crepath combine ~/projects/api 7b86a000ce7c6377c39429a3bd7e2080 9d95c4710638ebad
 
 ## Export archive
 
-`export` writes a `.crepath` gzip archive: the `workspaceStorage` directory, the projects directory, `composerHeaders` rows, composer-keyed `cursorDiskKV` rows, a `storage.json` excerpt, and a manifest with version and checksums. `import` reads that archive back.
+`export` writes a `.crepath` gzip archive: the `workspaceStorage` directory, the projects directory, `composerHeaders` rows, composer-keyed `cursorDiskKV` rows, the `agentKv` blobs those chats reference, a `storage.json` excerpt, and a manifest with version and checksums. Rows keep their SQLite type, so `NULL` and binary values survive. `export` refuses to overwrite an existing file.
+
+`import` verifies every checksum, rejects unsafe paths and ids, and writes in one transaction. Chats that already exist are skipped unless you pass `--overwrite`. With `TO`, the workspace id is recomputed for that path and the chats' paths are rewritten to it.
 
 ## Where Cursor stores it
 
-Each workspace id is derived from the absolute path and the filesystem birth time. Linux filesystems without birth time can hash differently.
+Workspace ids follow VS Code's formula. A folder hashes its path plus its birth time in milliseconds (rounded on macOS, floored on Windows) or, on Linux, its inode. A `.code-workspace` file or an unsaved `Workspaces/<ts>/workspace.json` hashes its config path, lowercased except on Linux. Paths are normalized first (absolute, no `.`/`..`, no trailing separator), and Windows paths use Cursor's `file:///c%3A/...` URI form.
 
-| Platform | Workspace storage |
-| --- | --- |
-| macOS | `~/Library/Application Support/Cursor/User/workspaceStorage/` |
-| Linux | `~/.config/Cursor/User/workspaceStorage/` |
-| Windows | `%APPDATA%\Cursor\User\workspaceStorage\` |
+| Platform | Workspace storage                                             |
+| -------- | ------------------------------------------------------------- |
+| macOS    | `~/Library/Application Support/Cursor/User/workspaceStorage/` |
+| Linux    | `~/.config/Cursor/User/workspaceStorage/`                     |
+| Windows  | `%APPDATA%\Cursor\User\workspaceStorage\`                     |
 
 `crepath` also updates `workspace.json`, `globalStorage/storage.json`, the matching rows in `globalStorage/state.vscdb`, and `~/.cursor/projects/`. The default user directory and each `userDataProfiles` entry are included. `--profile` filters that set.
 
-A backup is taken before the first write, so an abort leaves a restorable state.
+Every write command runs as one database transaction with an undo journal in `~/.crepath/backups`: the original image of each row it touches, plus copies of `storage.json` and the workspace files it changes. If a step fails, verification fails, or Cursor starts, everything is rolled back, including folder moves and transcripts. The journal is deleted after a verified run and kept only when a rollback could not finish. Free space is checked up front for the database log, the journal, and any copies.
 
 ## Build from source
 

@@ -7,7 +7,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 
-use super::{Runtime, dir_size, discover};
+use super::fsops::dir_size;
+use super::{Runtime, discover, open_global_ro};
 use crate::cursor::registry::load_headers;
 use crate::engine::db;
 use crate::ui;
@@ -20,11 +21,7 @@ pub fn render(rt: &Runtime) -> Result<String> {
             .entry(workspace.kind.label().to_string())
             .or_default() += 1;
     }
-    let conn = if rt.layout.global_db().exists() {
-        Some(db::open_rw(&rt.layout.global_db())?)
-    } else {
-        None
-    };
+    let conn = open_global_ro(rt)?;
     let headers = match &conn {
         Some(conn) => load_headers(conn)?,
         None => Vec::new(),

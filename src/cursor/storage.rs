@@ -1,15 +1,11 @@
-//! Global storage operations
-//!
-//! Handles updates to ~/Library/Application Support/Cursor/User/globalStorage/storage.json
+//! Global storage.json rewrites.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use super::rewrite::{Replacement, replace_scoped};
+use super::rewrite::{Replacement, Rewriter};
 
 /// Rewrite every string and object key in storage.json.
 ///
@@ -20,44 +16,57 @@ pub fn rewrite_storage_json<P: AsRef<Path>>(
     replacements: &[Replacement],
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let storage_path = storage_path.as_ref();
+    rewrite_storage_file(
+        storage_path.as_ref(),
+        &Rewriter::paths(replacements),
+        dry_run,
+    )
+}
+
+pub fn rewrite_storage_file(
+    storage_path: &Path,
+    rewriter: &Rewriter,
+    dry_run: bool,
+) -> Result<Vec<String>> {
     if !storage_path.exists() {
         return Ok(Vec::new());
     }
     let content = fs::read_to_string(storage_path)
         .with_context(|| format!("Failed to read: {}", storage_path.display()))?;
     let mut json: Value = serde_json::from_str(&content).context("Failed to parse storage.json")?;
-    let rewritten = rewrite_storage_value(&mut json, replacements);
+    let rewritten = rewrite_storage_value(&mut json, rewriter);
     if !rewritten.is_empty() && !dry_run {
         let new_content = serde_json::to_string_pretty(&json)?;
-        fs::write(storage_path, new_content)
+        let parent = storage_path
+            .parent()
+            .context("storage.json has no parent")?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut temp, new_content.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(storage_path)
+            .map_err(|err| err.error)
             .with_context(|| format!("Failed to write: {}", storage_path.display()))?;
     }
     Ok(rewritten)
 }
 
-pub fn rewrite_storage_value(value: &mut Value, replacements: &[Replacement]) -> Vec<String> {
+pub fn rewrite_storage_value(value: &mut Value, rewriter: &Rewriter) -> Vec<String> {
     let mut rewritten = Vec::new();
-    walk_json(value, "", replacements, &mut rewritten);
+    walk_json(value, "", rewriter, &mut rewritten);
     rewritten
 }
 
-fn walk_json(
-    value: &mut Value,
-    path: &str,
-    replacements: &[Replacement],
-    rewritten: &mut Vec<String>,
-) {
+fn walk_json(value: &mut Value, path: &str, rewriter: &Rewriter, rewritten: &mut Vec<String>) {
     match value {
-        Value::Object(map) => walk_object(map, path, replacements, rewritten),
+        Value::Object(map) => walk_object(map, path, rewriter, rewritten),
         Value::Array(items) => {
             for (index, item) in items.iter_mut().enumerate() {
                 let child = format!("{path}[{index}]");
-                walk_json(item, &child, replacements, rewritten);
+                walk_json(item, &child, rewriter, rewritten);
             }
         }
         Value::String(text) => {
-            let updated = replace_scoped(text, replacements);
+            let updated = rewriter.rewrite(text).into_owned();
             if updated != *text {
                 *text = updated;
                 rewritten.push(path.to_string());
@@ -70,7 +79,7 @@ fn walk_json(
 fn walk_object(
     map: &mut Map<String, Value>,
     path: &str,
-    replacements: &[Replacement],
+    rewriter: &Rewriter,
     rewritten: &mut Vec<String>,
 ) {
     let keys: Vec<String> = map.keys().cloned().collect();
@@ -82,66 +91,14 @@ fn walk_object(
         } else {
             format!("{path}.{key}")
         };
-        walk_json(&mut child, &child_path, replacements, rewritten);
-        let new_key = replace_scoped(&key, replacements);
+        walk_json(&mut child, &child_path, rewriter, rewritten);
+        let new_key = rewriter.rewrite(&key).into_owned();
         if new_key != key {
             rewritten.push(format!("{child_path}#key"));
         }
         rebuilt.insert(new_key, child);
     }
     *map = rebuilt;
-}
-
-/// Update workspace references in storage.json.
-pub fn update_storage_json<P: AsRef<Path>>(
-    storage_path: P,
-    old_uri: &str,
-    new_uri: &str,
-    dry_run: bool,
-) -> Result<bool> {
-    let rewritten =
-        rewrite_storage_json(storage_path, &[Replacement::new(old_uri, new_uri)], dry_run)?;
-    Ok(!rewritten.is_empty())
-}
-
-/// A simpler representation of storage.json for reading
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct StorageJson {
-    #[serde(rename = "backupWorkspaces")]
-    pub backup_workspaces: Option<BackupWorkspaces>,
-
-    #[serde(rename = "profileAssociations")]
-    pub profile_associations: Option<ProfileAssociations>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct BackupWorkspaces {
-    pub folders: Option<Vec<FolderEntry>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct FolderEntry {
-    #[serde(rename = "folderUri")]
-    pub folder_uri: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ProfileAssociations {
-    pub workspaces: Option<HashMap<String, String>>,
-}
-
-impl StorageJson {
-    /// Read storage.json from a file
-    #[allow(dead_code)]
-    pub fn read<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = fs::read_to_string(path.as_ref())
-            .with_context(|| format!("Failed to read: {}", path.as_ref().display()))?;
-        serde_json::from_str(&content).context("Failed to parse storage.json")
-    }
 }
 
 #[cfg(test)]
@@ -151,7 +108,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_update_storage_json() {
+    fn rewrites_backup_folders_and_profile_keys() {
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
@@ -170,16 +127,16 @@ mod tests {
 }}"#
         )
         .unwrap();
-
-        let modified =
-            update_storage_json(file.path(), "file:///old/path", "file:///new/path", false)
-                .unwrap();
-
-        assert!(modified);
-
-        // Verify changes
+        let rewritten = rewrite_storage_json(
+            file.path(),
+            &[Replacement::new("file:///old/path", "file:///new/path")],
+            false,
+        )
+        .unwrap();
+        assert!(!rewritten.is_empty());
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("file:///new/path"));
         assert!(!content.contains("file:///old/path"));
+        assert!(content.contains("file:///other/path"));
     }
 }
